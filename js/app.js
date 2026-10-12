@@ -482,8 +482,6 @@
   let chart, candle, vol, ema9S, ema21S, stUpS, stDnS, priceLines = [];
   // 高周期回归通道（中轴 + 上下沿）
   let chMidS, chUpS, chDnS;
-  // 通道是否参与价格轴自动缩放。15m 图上必须 false，否则 ±11% 的通道会压爆 K 线
-  let chAutoscale = false;
   function initChart() {
     chart = LightweightCharts.createChart($("chart"), {
       layout: { background: { color: "#0e1117" }, textColor: "#9aa3b5" },
@@ -513,12 +511,17 @@
     // 回归通道：淡青色。中轴虚线、上下沿点线，刻意做得比 EMA/Supertrend 弱，
     // 避免把这个"仅供参考、未经回测"的东西画得比真正驱动信号的指标还显眼。
     //
-    // autoscaleInfoProvider 动态开关（chAutoscale）：
-    // 15m 图上**必须排除**。日线通道半宽 ±11%，而 15m 图可见区间只有 2~3%，
-    // 不排除价格轴会被拉到覆盖整个通道（实测 74000~98000），K 线压成一条线。
-    // 切到 4h / 日线图时通道是该周期自己的，尺度匹配，这时放开让它参与缩放，
-    // 通道上下沿才会完整显示在图里。
-    const chOpt = { ...lineOpt, autoscaleInfoProvider: (orig) => (chAutoscale ? orig() : null) };
+    // autoscaleInfoProvider 返回 null = 通道不参与价格轴自动缩放。
+    //
+    // 这一条是必须的，而且三种配比都试过了：
+    //   1) 参与缩放 + 只画拟合窗口内 → 日线通道半宽 ±11%、跨度六万美元，
+    //      15m 图上价格轴被拉到 74000~98000，K线压成一条线
+    //   2) 不参与 + 只画窗口内 → 价格轴正常，但通道几乎永远在屏幕外，等于没有
+    //   3) 不参与 + 画满整图并外推（现在这个）→ 价格轴由K线决定、K线填满图表，
+    //      通道三条线贯穿整图，超出价格范围的那段自然裁掉。
+    // 通道在价格轴范围之外的部分看不到，但那部分对当下没有参考价值；
+    // 精确数值（斜率/r²/现价在通道中的百分比位置/上下沿价格）面板里一直有。
+    const chOpt = { ...lineOpt, autoscaleInfoProvider: () => null };
     // 中轴实虚线更亮更粗，上下轨稍暗一档但同色系，保证一眼能认出是一组
     chMidS = chart.addLineSeries({ ...chOpt, color: "rgba(0,217,255,.95)", lineWidth: 2, lineStyle: 2 });
     chUpS = chart.addLineSeries({ ...chOpt, color: "rgba(0,217,255,.7)", lineWidth: 2, lineStyle: 1 });
@@ -679,11 +682,17 @@
     const onLtf = ctf.key === "ltf";
     const chCfg = onLtf ? (CH_TF[state.chTf] ?? CH_TF["1d"]) : { label: ctf.label, n: ctf.chN, key: ctf.key, sec: ctf.sec };
     const chSrc = (d[chCfg.key] ?? []).filter((x) => x.time + (chCfg.sec ?? (chCfg.key === "d1" ? 86400 : 4 * 3600)) <= nowSec);
-    chAutoscale = !onLtf; // 非 15m 图时通道参与价格轴缩放
     const ch = Levels.channel(chSrc, chCfg.n);
     if (ch) {
-      // 只画在拟合窗口内的部分，不外推 —— 外推的通道会给人虚假的"目标位"暗示
-      const proj = (f) => k.map((x) => (x.time >= ch.from ? { time: T(x.time), value: f(ch.lineAt(x.time)) } : { time: T(x.time) }));
+      // 通道是一条直线，画满整张图：拟合窗口左边的部分往前延伸，右边往未来延伸
+      // FWD 根，把 rightOffset 那段留白填上。
+      // 注意这超出拟合窗口的部分是**外推**：直线本身是用窗口内的数据算的，
+      // 延伸出去只是把同一条直线画长，不代表那段也拟合得这么好。
+      const FWD = 8;
+      const lastT = k[k.length - 1].time;
+      const times = k.map((x) => x.time);
+      for (let i = 1; i <= FWD; i++) times.push(lastT + i * ctf.sec);
+      const proj = (f) => times.map((t) => ({ time: T(t), value: f(ch.lineAt(t)) }));
       chMidS.setData(proj((v) => v.mid));
       chUpS.setData(proj((v) => v.up));
       chDnS.setData(proj((v) => v.dn));
