@@ -33,6 +33,22 @@ const Strategy = (() => {
     // 价格跌回信号价另一侧（多单跌回信号价下方）时胜率明显下降
     entryWindowBars: 2,
     maxChaseR: 0.6,
+
+    // ───────── MTF 版新增。全部默认关闭，默认参数下与原版逐笔一致 ─────────
+    // 第 2 层：止损候选位加入高周期硬位（4h/日线摆动点 + 周高低聚类出的位）
+    htfStop: false,
+    // 锚定到高周期硬位时允许的最大止损宽度（倍 ATR）。必须 > maxRiskAtr，
+    // 否则日线硬位往往比 2 倍 15m ATR 远得多，止损只会顶到原上限，等于没测到东西
+    htfStopMaxAtr: 3.0,
+    // 第 3 层：regime gate。"off" 不过滤 / "trend" 只在趋势出信号 / "range" 只在震荡出信号
+    regimeGate: "off",
+    regimeTf: "1d",      // regime 判定用的周期："1d" 或 "4h"
+    regimeN: 30,         // regime 回看根数
+    regimeEr: 0.35,      // 效率比阈值，≥ 判趋势
+    regimeMinR2: 0,      // 回归通道 r² 下限（0 = 不启用这一条）
+    regimeChN: 60,       // 通道拟合根数
+    // regime 要求方向与信号一致（趋势↑只做多）。仅在 regimeGate="trend" 时生效
+    regimeAlign: false,
   };
 
   function computeHtf(k) {
@@ -135,7 +151,7 @@ const Strategy = (() => {
     return null;
   }
 
-  function buildLevels(ind, i, side, p, lvls) {
+  function buildLevels(ind, i, side, p, lvls, hardLvls) {
     const entry = ind.c[i], atr = ind.atr[i];
     let structural = side > 0
       ? Math.min(TA.lowest(ind.l, 3, i), ind.st.dir[i] === 1 ? ind.st.line[i] : Infinity) - 0.2 * atr
@@ -146,8 +162,24 @@ const Strategy = (() => {
     if (p.srStop && behind && Math.abs(entry - behind.price) <= p.maxRiskAtr * atr) {
       structural = side > 0 ? Math.min(structural, behind.lo - 0.25 * atr) : Math.max(structural, behind.hi + 0.25 * atr);
     }
+    // 第 2 层：身后最近的高周期硬位。只有命中时才放宽止损上限到 htfStopMaxAtr，
+    // 否则（上限仍是 maxRiskAtr）日线位会被 clamp 吃掉，改动等于无效
+    let capAtr = p.maxRiskAtr, htfBehind = null;
+    if (p.htfStop && hardLvls && hardLvls.length) {
+      const nh = Levels.nearest(hardLvls, entry, 0.15 * atr);
+      htfBehind = side > 0 ? nh.sup : nh.res;
+      if (htfBehind) {
+        const edge = side > 0 ? htfBehind.lo - 0.25 * atr : htfBehind.hi + 0.25 * atr;
+        if (Math.abs(entry - edge) <= p.htfStopMaxAtr * atr) {
+          structural = side > 0 ? Math.min(structural, edge) : Math.max(structural, edge);
+          capAtr = p.htfStopMaxAtr;
+        } else {
+          htfBehind = null; // 太远，用不上
+        }
+      }
+    }
     let risk = Math.abs(entry - structural);
-    risk = Math.min(Math.max(risk, p.minRiskAtr * atr), p.maxRiskAtr * atr); // 止损宽度限制在 ATR 区间内
+    risk = Math.min(Math.max(risk, p.minRiskAtr * atr), capAtr * atr); // 止损宽度限制在 ATR 区间内
     const tp1 = entry + side * risk * p.tp1R;
     let tp2 = entry + side * risk * p.tp2R, tp2Src = `${p.tp2R}R`;
     if (p.srTarget) {
@@ -163,10 +195,49 @@ const Strategy = (() => {
       }
     }
     const roomR = ahead ? Math.abs(ahead.price - entry) / risk : Infinity;
-    return { entry, sl: entry - side * risk, risk, atr, tp1, tp2, tp2Src, roomR, ahead, behind };
+    return { entry, sl: entry - side * risk, risk, atr, tp1, tp2, tp2Src, roomR, ahead, behind, htfBehind, capAtr };
   }
 
   const isWeekend = (t) => { const d = new Date(t * 1000).getUTCDay(); return d === 0 || d === 6; };
+
+  // MTF 上下文：高周期硬位 + regime 判定。
+  // 无未来函数：Levels.htf / regime / channel 都只吃 closeTime 之前已收盘的高周期K线。
+  // 性能：这些量只在 4h / 日线收盘边界上变化，所以按 4h 桶缓存（日线边界是 4h 边界的整数倍），
+  // 否则每根 15m 都重算一遍高周期聚类，长样本下会退化。
+  function mtfCtx(p, opts) {
+    const h4k = opts.h4k || [], d1k = opts.d1k || [];
+    if (!h4k.length && !d1k.length) return null;
+    const useTf4h = p.regimeTf === "4h";
+    const rSrc = useTf4h ? h4k : d1k, rSec = useTf4h ? 4 * 3600 : 86400;
+    let bucket = -1, cached = null;
+    return function at(closeTime) {
+      const key = Math.floor(closeTime / (4 * 3600));
+      if (key !== bucket) {
+        bucket = key;
+        const closed = rSrc.filter((x) => x.time + rSec <= closeTime);
+        cached = {
+          hard: p.htfStop ? Levels.htf(h4k, d1k, closeTime).filter((l) => l.hard) : null,
+          regime: p.regimeGate !== "off" ? Levels.regime(closed, p.regimeN, p.regimeEr) : null,
+          channel: p.regimeGate !== "off" && p.regimeMinR2 > 0 ? Levels.channel(closed, p.regimeChN) : null,
+        };
+      }
+      return cached;
+    };
+  }
+
+  // regime gate：返回 true = 放行
+  function regimeOk(p, m, side) {
+    if (p.regimeGate === "off") return true;
+    if (!m || !m.regime) return false; // 要求过滤但数据不足 → 不开仓（保守）
+    if (p.regimeMinR2 > 0 && !(m.channel && m.channel.r2 >= p.regimeMinR2)) return false;
+    if (p.regimeGate === "trend") {
+      if (!m.regime.trending) return false;
+      if (p.regimeAlign && (m.regime.up ? 1 : -1) !== side) return false;
+      return true;
+    }
+    if (p.regimeGate === "range") return !m.regime.trending;
+    return true;
+  }
 
   // 生成全部历史信号（仅已收盘K线；最后一根若未收盘则排除）
   function run(ltfK, htfK, interval, opts = {}) {
@@ -176,6 +247,7 @@ const Strategy = (() => {
     const htfAligned = alignHtf(ltfK, htf, interval);
     const srCtx = Levels.prepare(ltfK, htfK);
     const levelsAt = (i) => Levels.at(srCtx, ltfK[i].time + interval, 0.6 * ind.atr[i]);
+    const mtfAt = (p.htfStop || p.regimeGate !== "off") ? mtfCtx(p, opts) : null;
     const signals = [];
     const lastSig = { 1: -1e9, "-1": -1e9 };
     const nowSec = Date.now() / 1000;
@@ -184,18 +256,21 @@ const Strategy = (() => {
       if (ltfK[i].time + interval > nowSec) break; // 未收盘
       if (isNaN(ind.atr[i]) || isNaN(ind.adx.adx[i]) || isNaN(ind.volMa[i])) continue;
       if (p.skipWeekend && p.market !== "crypto" && isWeekend(ltfK[i].time)) continue;
+      // 本根收盘时可见的高周期信息（未收盘的高周期K线不参与）
+      const m = mtfAt ? mtfAt(ltfK[i].time + interval) : null;
       for (const side of [1, -1]) {
         if (i - lastSig[side] < p.cooldownBars) continue;
         const htfRow = htfAligned[i];
         if (p.strictHtf && (!htfRow || htfRow.trend !== side)) continue;
         if (p.htfStrong && !htfRow?.strong) continue;
         if (p.minAdx && !(ind.adx.adx[i] >= p.minAdx && (side > 0 ? ind.adx.pdi[i] > ind.adx.mdi[i] : ind.adx.mdi[i] > ind.adx.pdi[i]))) continue;
+        if (!regimeOk(p, m, side)) continue;
         const trig = triggerAt(ind, i, side, p);
         if (!trig) continue;
         if (Math.abs(ind.c[i] - ind.ema21[i]) > p.maxChaseAtr * ind.atr[i]) continue;
         const sc = scoreAt(ind, htfRow, i, side);
         if (sc.score < p.scoreThreshold) continue;
-        const lv = buildLevels(ind, i, side, p, levelsAt(i));
+        const lv = buildLevels(ind, i, side, p, levelsAt(i), m?.hard);
         if ((lv.risk / lv.entry) * 100 < p.minRiskPct) continue;
         if (p.maxFeeR && ((p.feePct / 100) * lv.entry) / lv.risk > p.maxFeeR) continue;
         if (p.minRoomR && lv.roomR < p.minRoomR) continue;
@@ -203,6 +278,7 @@ const Strategy = (() => {
           i, time: ltfK[i].time, side, trigger: trig, score: sc.score, items: sc.items,
           entry: lv.entry, sl: lv.sl, tp1: lv.tp1, tp2: lv.tp2, tp2Src: lv.tp2Src,
           risk: lv.risk, roomR: lv.roomR, ahead: lv.ahead, behind: lv.behind,
+          htfStopUsed: !!lv.htfBehind, riskAtr: lv.risk / lv.atr,
         });
         lastSig[side] = i;
       }

@@ -158,7 +158,9 @@
   function recompute(sym) {
     const d = state.data[sym];
     if (!d || d.ltf.length < 100) return;
-    d.res = Strategy.run(d.ltf, d.htf, LTF_SEC, paramsFor(sym));
+    // 额外把 4h / 日线喂进去：htfStop（高周期硬位止损）和 regimeGate 需要。
+    // 两者默认关闭，此时 Strategy 内部不会碰这两个数组，行为与原版一致。
+    d.res = Strategy.run(d.ltf, d.htf, LTF_SEC, { ...paramsFor(sym), h4k: d.h4, d1k: d.d1 });
     d.computedAt = Date.now();
     // 大周期背景（只显示和统计，不影响信号）
     d.ctx = { h4: Strategy.trendSeries(d.h4, 14400), d1: Strategy.trendSeries(d.d1, 86400) };
