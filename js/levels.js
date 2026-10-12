@@ -118,6 +118,144 @@ const Levels = (() => {
     return out.map((c) => ({ price: c.sum / c.touches, touches: c.touches, lo: c.lo, hi: c.hi }));
   }
 
+  // ───────────────────────────────────────────────────────────────────────────
+  // 以下为 MTF 版新增（显示层）。全部只用已收盘K，无未来函数。
+  //
+  // ⚠️ 重要：这一节的阈值（权重、回看天数、tol 系数、ER 阈值）都是**拍的，没有回测
+  // 验证过**。和上面 testState / rejection 那些带回测数字的注释不是一个性质。
+  // 它们只用于在图上画出来辅助人工判断，不参与信号、不参与止损。
+  // 要把其中任何一项变成过滤条件，必须先过 walk-forward（见 quant/ 实验框架：
+  // 11 个滚动窗口上，对这套策略做参数优化的结果比固定参数更差 0.015R）。
+  // ───────────────────────────────────────────────────────────────────────────
+
+  // 高周期关键位：4h + 日线摆动点合并聚类。
+  // 相比原来的 daily()，多了 4h 这一层 —— 原项目止损只用 15m/1h 位，
+  // 4h 这个粒度正好是"比 1h 硬、又比日线贴近当前价"的那一档。
+  // 权重：4h 摆动点 3，日线摆动点 5，近 7 日高低 5（和 strength ≥ 5 的"强位"口径对齐）
+  function htf(h4k, d1k, nowSec) {
+    const pts = [];
+    const push = (price, weight, src) => pts.push({ price, weight, src });
+
+    // 4h：左右各 3 根（前后 12 小时都没更高/更低），看近 60 天
+    const h4 = (h4k || []).filter((x) => x.time + 4 * 3600 <= nowSec).slice(-360);
+    for (let j = 3; j < h4.length - 3; j++) {
+      let isH = true, isL = true;
+      for (let m = j - 3; m <= j + 3; m++) {
+        if (m === j) continue;
+        if (h4[m].high >= h4[j].high) isH = false;
+        if (h4[m].low <= h4[j].low) isL = false;
+      }
+      if (isH) push(h4[j].high, 3, "4h");
+      if (isL) push(h4[j].low, 3, "4h");
+    }
+
+    // 日线：左右各 2 根，看近 180 天
+    const d1 = (d1k || []).filter((x) => x.time + 86400 <= nowSec).slice(-180);
+    for (let j = 2; j < d1.length - 2; j++) {
+      let isH = true, isL = true;
+      for (let m = j - 2; m <= j + 2; m++) {
+        if (m === j) continue;
+        if (d1[m].high >= d1[j].high) isH = false;
+        if (d1[m].low <= d1[j].low) isL = false;
+      }
+      if (isH) push(d1[j].high, 5, "日线");
+      if (isL) push(d1[j].low, 5, "日线");
+    }
+    if (d1.length >= 7) {
+      const w = d1.slice(-7);
+      push(Math.max(...w.map((x) => x.high)), 5, "周高");
+      push(Math.min(...w.map((x) => x.low)), 5, "周低");
+    }
+    if (!pts.length) return [];
+
+    // 合并容差用日线真实波幅，比用 15m ATR 宽得多 —— 高周期位本来就该是"区"而不是"线"
+    const base = d1.length >= 14 ? d1.slice(-14) : d1;
+    const tol = base.reduce((a, x) => a + (x.high - x.low), 0) / base.length * 0.3;
+    // 簇总宽度上限。只看"相邻间隔 ≤ tol"会产生链式合并：密集的摆动点一个接一个串下去，
+    // 最后糊出一个占价格 20% 的"价位"。实测加入 4h 点后每个品种都会出现一个
+    // strength 300+、宽 12~14 倍 tol 的巨簇。所以再加一条总宽度约束。
+    const maxWidth = tol * 1.5;
+
+    pts.sort((a, b) => a.price - b.price);
+    const out = [];
+    let cur = null;
+    for (const p of pts) {
+      if (cur && p.price - cur.hi <= tol && p.price - cur.lo <= maxWidth) {
+        cur.sumPW += p.price * p.weight; cur.strength += p.weight; cur.touches++; cur.hi = p.price;
+        cur.srcs.add(p.src);
+      } else {
+        cur = { sumPW: p.price * p.weight, strength: p.weight, touches: 1, lo: p.price, hi: p.price, srcs: new Set([p.src]) };
+        out.push(cur);
+      }
+    }
+    return out.map((c) => ({
+      // 钳位：单点簇的 p*w/w 有浮点误差（实测 2.8e-14），会让 price 掉到 [lo,hi] 外
+      price: Math.min(c.hi, Math.max(c.lo, c.sumPW / c.strength)),
+      strength: c.strength, touches: c.touches,
+      lo: c.lo, hi: c.hi, srcs: [...c.srcs],
+      // 日线/周高低参与过的位 = 硬位；纯 4h 堆出来的 = 软位
+      hard: c.srcs.has("日线") || c.srcs.has("周高") || c.srcs.has("周低"),
+    }));
+  }
+
+  // 线性回归通道：对 log(收盘价) 做最小二乘，中轴 ± mult 倍残差标准差。
+  // 用回归而不是手连趋势线，是因为手连趋势线要选锚点 —— 换两个点整条线就变了，
+  // 不可复现也无法回测。回归通道是确定性的：给定 K 线和窗口长度，结果唯一。
+  // 取 log 价格使通道上下在百分比意义上等宽（线性价格会让下沿被压扁）。
+  function channel(k, n, barSec, mult = 2) {
+    const w = (k || []).slice(-n);
+    if (w.length < 10) return null;
+    const N = w.length;
+    const y = w.map((x) => Math.log(x.close));
+    const xm = (N - 1) / 2, ym = y.reduce((a, b) => a + b, 0) / N;
+    let sxy = 0, sxx = 0;
+    for (let i = 0; i < N; i++) { sxy += (i - xm) * (y[i] - ym); sxx += (i - xm) * (i - xm); }
+    if (sxx === 0) return null;
+    const b = sxy / sxx, a = ym - b * xm;
+    let ssr = 0, sst = 0;
+    for (let i = 0; i < N; i++) { const f = a + b * i; ssr += (y[i] - f) ** 2; sst += (y[i] - ym) ** 2; }
+    const sigma = Math.sqrt(ssr / Math.max(1, N - 2));
+    const r2 = sst > 0 ? 1 - ssr / sst : 0;
+    const barsPerDay = 86400 / barSec;
+    return {
+      // 每根K线一个点，供图表画三条斜线
+      points: w.map((x, i) => ({
+        time: x.time,
+        mid: Math.exp(a + b * i),
+        up: Math.exp(a + b * i + mult * sigma),
+        dn: Math.exp(a + b * i - mult * sigma),
+      })),
+      r2,                                                  // 拟合度：越高说明"趋势"这个描述越贴合
+      pctPerDay: (Math.exp(b * barsPerDay) - 1) * 100,     // 中轴日斜率（%）
+      bandPct: (Math.exp(mult * sigma) - 1) * 100,         // 通道半宽（%）
+      slopeUp: b > 0,
+      n: N,
+    };
+  }
+
+  // 趋势 / 震荡判定。用 Kaufman 效率比（净位移 / 路径总长）：
+  //   ER → 1 单边走，ER → 0 来回磨。比 ADX 直观，而且没有 ADX 的平滑滞后。
+  // 震荡时给出 Donchian 上下沿作为区间边界。
+  // 阈值 0.35 是拍的，没验证过（见本节开头警告）。
+  function regime(k, n, erThreshold = 0.35) {
+    const w = (k || []).slice(-n);
+    if (w.length < 10) return null;
+    let path = 0;
+    for (let i = 1; i < w.length; i++) path += Math.abs(w[i].close - w[i - 1].close);
+    const net = Math.abs(w[w.length - 1].close - w[0].close);
+    const er = path > 0 ? net / path : 0;
+    const hi = Math.max(...w.map((x) => x.high)), lo = Math.min(...w.map((x) => x.low));
+    const mid = (hi + lo) / 2;
+    return {
+      er,
+      trending: er >= erThreshold,
+      hi, lo, mid,
+      widthPct: mid > 0 ? (hi - lo) / mid * 100 : 0,
+      up: w[w.length - 1].close > w[0].close,
+      n: w.length,
+    };
+  }
+
   // 判定"碰到价位"用的窄区间：画线位置上下 0.4 ATR（聚类区可能很宽，不能直接用）
   const zone = (L, atr) => ({ lo: Math.max(L.lo, L.price - 0.4 * atr), hi: Math.min(L.hi, L.price + 0.4 * atr) });
 
@@ -150,5 +288,5 @@ const Levels = (() => {
     return null;
   }
 
-  return { prepare, at, nearest, daily, testState, rejection };
+  return { prepare, at, nearest, daily, htf, channel, regime, testState, rejection };
 })();
