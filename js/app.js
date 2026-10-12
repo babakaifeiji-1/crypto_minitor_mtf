@@ -23,9 +23,13 @@
   // 6 个月 6 个币回测：这类信号每笔 -0.15R，其余 -0.02R，前后两半和 5/6 个币结论一致
   const HOT_FLOW = 0.2;
 
+  // localStorage 前缀。本仓库（mtf 版）部署在 babakaifeiji-1.github.io 的另一个路径下，
+  // 和原版 crypto_minitor 是**同一个 origin**，localStorage 是共用的。
+  // 必须和原版的 "tm_" 区分开，否则两个看板会互相覆盖设置、分组统计和推送开关。
+  const STORE_PREFIX = "mtf_";
   const store = {
-    load(key, def) { try { const v = JSON.parse(localStorage.getItem("tm_" + key)); return v ?? def; } catch { return def; } },
-    save(key, v) { localStorage.setItem("tm_" + key, JSON.stringify(v)); },
+    load(key, def) { try { const v = JSON.parse(localStorage.getItem(STORE_PREFIX + key)); return v ?? def; } catch { return def; } },
+    save(key, v) { localStorage.setItem(STORE_PREFIX + key, JSON.stringify(v)); },
   };
 
   function initialSymbols() {

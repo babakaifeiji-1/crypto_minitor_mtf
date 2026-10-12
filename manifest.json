@@ -1,7 +1,7 @@
 {
-  "name": "盯盘助手",
-  "short_name": "盯盘助手",
-  "description": "币安永续合约 15m 趋势跟随盯盘",
+  "name": "盯盘助手 MTF",
+  "short_name": "盯盘MTF",
+  "description": "币安永续合约盯盘 · 多周期关键位 / 回归通道 / 震荡区间",
   "start_url": "./index.html",
   "display": "standalone",
   "background_color": "#0e1117",
