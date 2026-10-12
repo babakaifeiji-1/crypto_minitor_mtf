@@ -146,7 +146,8 @@
 
   async function loadSymbol(sym) {
     const [ltf, htf, h4, d1] = await Promise.all([
-      fetchKlines(sym, LTF, 1500), fetchKlines(sym, HTF, 500), fetchKlines(sym, "4h", 300), fetchKlines(sym, "1d", 200),
+      // 4h/日线拉得比原版多：通道拟合窗口拉长到 4h 360 根 / 日线 120 根，还要留出余量
+      fetchKlines(sym, LTF, 1500), fetchKlines(sym, HTF, 500), fetchKlines(sym, "4h", 1000), fetchKlines(sym, "1d", 500),
     ]);
     const prev = state.data[sym];
     state.data[sym] = {
@@ -517,19 +518,17 @@
     // 不排除价格轴会被拉到覆盖整个通道（实测 74000~98000），K 线压成一条线。
     // 切到 4h / 日线图时通道是该周期自己的，尺度匹配，这时放开让它参与缩放，
     // 通道上下沿才会完整显示在图里。
-    const chOpt = {
-      ...lineOpt, color: "rgba(120,200,220,.55)",
-      autoscaleInfoProvider: (orig) => (chAutoscale ? orig() : null),
-    };
-    chMidS = chart.addLineSeries({ ...chOpt, lineWidth: 1, lineStyle: 2 });
-    chUpS = chart.addLineSeries({ ...chOpt, lineWidth: 1, lineStyle: 1 });
-    chDnS = chart.addLineSeries({ ...chOpt, lineWidth: 1, lineStyle: 1 });
+    const chOpt = { ...lineOpt, autoscaleInfoProvider: (orig) => (chAutoscale ? orig() : null) };
+    // 中轴实虚线更亮更粗，上下轨稍暗一档但同色系，保证一眼能认出是一组
+    chMidS = chart.addLineSeries({ ...chOpt, color: "rgba(0,217,255,.95)", lineWidth: 2, lineStyle: 2 });
+    chUpS = chart.addLineSeries({ ...chOpt, color: "rgba(0,217,255,.7)", lineWidth: 2, lineStyle: 1 });
+    chDnS = chart.addLineSeries({ ...chOpt, color: "rgba(0,217,255,.7)", lineWidth: 2, lineStyle: 1 });
   }
 
   // 15m 图上"趋势通道"面板用的周期档位
   const CH_TF = {
-    "1d": { label: "日线", n: 60, key: "d1", sec: 86400 },
-    "4h": { label: "4h", n: 180, key: "h4", sec: 4 * 3600 },
+    "1d": { label: "日线", n: 120, key: "d1", sec: 86400 },   // 约 4 个月
+    "4h": { label: "4h", n: 360, key: "h4", sec: 4 * 3600 },  // 约 2 个月
   };
 
   function syncChartTfBtns() {
@@ -539,8 +538,8 @@
   // 主图可切换的周期。chN = 该周期上通道拟合根数，rgN = 震荡判定回看根数
   const CHART_TF = {
     "15m": { label: "15m", key: "ltf", sec: LTF_SEC, bars: 160, chN: 0, rgN: 0 },
-    "4h": { label: "4h", key: "h4", sec: 4 * 3600, bars: 180, chN: 180, rgN: 90 },
-    "1d": { label: "日线", key: "d1", sec: 86400, bars: 120, chN: 60, rgN: 30 },
+    "4h": { label: "4h", key: "h4", sec: 4 * 3600, bars: 400, chN: 360, rgN: 120 },
+    "1d": { label: "日线", key: "d1", sec: 86400, bars: 150, chN: 120, rgN: 45 },
   };
 
   // 大周期方向：取当前（含未收盘）K线的 Supertrend
@@ -668,9 +667,9 @@
       .forEach((l) => {
         const isRes = l.price > pxNow;
         add(l.price,
-          l.hard ? "rgba(179,136,255,.8)" : "rgba(179,136,255,.4)",
+          l.hard ? "rgba(188,148,255,.98)" : "rgba(188,148,255,.62)",
           `${l.srcs.join("+")}${isRes ? "压力" : "支撑"}`,
-          0, l.hard ? 2 : 1);
+          0, l.hard ? 3 : 2);
       });
 
     // 高周期回归通道。
@@ -698,8 +697,8 @@
     const rg = Levels.regime(chSrc, onLtf ? (chCfg.key === "d1" ? 30 : 90) : ctf.rgN);
     if (rg && !rg.trending) {
       const near = (p) => !onLtf || Math.abs(p - pxNow) <= 6 * atrNow;
-      if (near(rg.hi)) add(rg.hi, "rgba(245,166,35,.6)", `${chCfg.label}震荡上沿`, 3, 1);
-      if (near(rg.lo)) add(rg.lo, "rgba(245,166,35,.6)", `${chCfg.label}震荡下沿`, 3, 1);
+      if (near(rg.hi)) add(rg.hi, "rgba(255,170,40,.95)", `${chCfg.label}震荡上沿`, 3, 2);
+      if (near(rg.lo)) add(rg.lo, "rgba(255,170,40,.95)", `${chCfg.label}震荡下沿`, 3, 2);
     }
 
     // 当前信号 / 持仓
