@@ -581,7 +581,8 @@
 
   // K线信息条：开高低收、涨跌幅（相对上一根收盘）、振幅（最高最低差 / 上一根收盘）
   let hoverIdx = -1;
-  let chartBars = null; // 当前主图实际画的那组K线（15m / 4h / 日线）
+  let chartBars = null;  // 当前主图实际画的那组K线（15m / 4h / 日线）
+  let chartStats = null; // 当前主图周期的指标快照；15m 时为 null（直接用策略算好的）
   function renderOhlc() {
     const d = state.data[state.active];
     if (!d?.ltf?.length) return;
@@ -596,8 +597,8 @@
       <span><span class="k">低</span><span class="short">${fmtPrice(x.low)}</span></span>
       <span><span class="k">收</span><span class="${cls}">${fmtPrice(x.close)}</span></span>
       <span><span class="k">涨跌</span><span class="${cls}">${chg >= 0 ? "+" : ""}${chg.toFixed(2)}%</span></span>
-      <span><span class="k">振幅</span>${amp.toFixed(2)}%</span>
-      <span><span class="k">量</span>${vol}</span>`);
+      <span class="ohlc-extra"><span class="k">振幅</span>${amp.toFixed(2)}%</span>
+      <span class="ohlc-extra"><span class="k">量</span>${vol}</span>`);
   }
 
   function renderChart() {
@@ -607,12 +608,26 @@
     // 主图周期。15m = 原版行为；4h / 日线 = 看大结构，此时信号标记和 15m 指标不适用
     const ctf = CHART_TF[state.chartTf] ?? CHART_TF["15m"];
     const isLtf = ctf.key === "ltf";
+    const narrowUi = matchMedia("(max-width: 900px)").matches; // 窄屏缩短价格线标签
     const k = (d[ctf.key] ?? []).filter((x) => x.time + ctf.sec <= Date.now() / 1000 || isLtf);
     if (!k.length) return;
     // 15m 用策略已算好的指标；高周期现算（同样的 TA 函数、同样的参数）
     const ind = isLtf ? d.res.ind : (() => {
       const c = k.map((x) => x.close), h = k.map((x) => x.high), l = k.map((x) => x.low);
       return { ema9: TA.ema(c, 9), ema21: TA.ema(c, 21), st: TA.supertrend(h, l, c, 10, 3), atr: TA.atr(h, l, c, 14) };
+    })();
+    // 底部指标条要跟着主图周期走，否则看着日线K线却读到 15m 的 RSI/ADX/ATR
+    chartStats = isLtf ? null : (() => {
+      const c = k.map((x) => x.close), h = k.map((x) => x.high), l = k.map((x) => x.low), v = k.map((x) => x.volume);
+      const i = c.length - 1;
+      const rsi = TA.rsi(c, 14), ax = TA.adx(h, l, c, 14), md = TA.macd(c), vma = TA.sma(v, 20);
+      return {
+        tf: ctf.label,
+        rsi: rsi[i], adx: ax.adx[i], macdHist: md.hist[i],
+        volRatio: vma[i] > 0 ? v[i] / vma[i] : NaN,
+        atr: ind.atr[i], atrPct: (ind.atr[i] / c[i]) * 100,
+        stDir: ind.st.dir[i],
+      };
     })();
 
     chartBars = k; // 供 OHLC 信息条和十字光标用（它们要跟着主图周期走）
@@ -654,7 +669,9 @@
       if (l.strength < 3) return;
       const strong = l.strength >= 5;
       const color = isRes ? (strong ? "rgba(239,83,80,.95)" : "rgba(239,83,80,.45)") : strong ? "rgba(38,166,154,.95)" : "rgba(38,166,154,.45)";
-      const name = `${strong ? "强" : ""}${isRes ? "压力" : "支撑"}${stars(l)}${l.tags.length ? " " + l.tags.join("/") : ""}`;
+      const name = narrowUi
+        ? `${strong ? "强" : ""}${isRes ? "压" : "撑"}${stars(l)}`
+        : `${strong ? "强" : ""}${isRes ? "压力" : "支撑"}${stars(l)}${l.tags.length ? " " + l.tags.join("/") : ""}`;
       add(l.price, color, name, strong ? 0 : 1, strong ? 3 : 1);
     };
     kl.above.forEach((l) => drawLv(l, true));
@@ -663,16 +680,20 @@
     // 高周期关键位（4h + 日线）。硬位（日线/周高低参与）紫色粗线，软位（纯 4h）灰紫细线
     const pxNow = k[k.length - 1].close, atrNow = ind.atr[ind.atr.length - 1];
     const nowSec = Date.now() / 1000;
+    // 条数：15m 宽屏 3+3；高周期图或窄屏 2+2。
+    // 日线尺度上离现价 5% 开外的位参考价值很低，而标签会把右侧 K 线盖掉
+    const nLv = (!isLtf || narrowUi) ? 2 : 3;
     const hLv = Levels.htf(d.h4, d.d1, nowSec).filter((l) => Math.abs(l.price - pxNow) <= 15 * atrNow);
     const pick = (arr, n) => arr.slice(0, n);
-    [...pick(hLv.filter((l) => l.price > pxNow).sort((a, b) => a.price - b.price), 3),
-     ...pick(hLv.filter((l) => l.price <= pxNow).sort((a, b) => b.price - a.price), 3)]
+    [...pick(hLv.filter((l) => l.price > pxNow).sort((a, b) => a.price - b.price), nLv),
+     ...pick(hLv.filter((l) => l.price <= pxNow).sort((a, b) => b.price - a.price), nLv)]
       .forEach((l) => {
         const isRes = l.price > pxNow;
-        add(l.price,
-          l.hard ? "rgba(188,148,255,.98)" : "rgba(188,148,255,.62)",
-          `${l.srcs.join("+")}${isRes ? "压力" : "支撑"}`,
-          0, l.hard ? 3 : 2);
+        // 窄屏上标签越长，价格轴留给数字的宽度就越少，实测会把价格截断成「8…」
+        const nm = narrowUi
+          ? `${l.hard ? "硬" : ""}${isRes ? "压" : "撑"}`
+          : `${l.srcs.join("+")}${isRes ? "压力" : "支撑"}`;
+        add(l.price, l.hard ? "rgba(188,148,255,.98)" : "rgba(188,148,255,.62)", nm, 0, l.hard ? 3 : 2);
       });
 
     // 高周期回归通道。
@@ -706,8 +727,9 @@
     const rg = Levels.regime(chSrc, onLtf ? (chCfg.key === "d1" ? 30 : 90) : ctf.rgN);
     if (rg && !rg.trending) {
       const near = (p) => !onLtf || Math.abs(p - pxNow) <= 6 * atrNow;
-      if (near(rg.hi)) add(rg.hi, "rgba(255,170,40,.95)", `${chCfg.label}震荡上沿`, 3, 2);
-      if (near(rg.lo)) add(rg.lo, "rgba(255,170,40,.95)", `${chCfg.label}震荡下沿`, 3, 2);
+      const rn = (t) => (narrowUi ? `区间${t}` : `${chCfg.label}震荡${t}沿`);
+      if (near(rg.hi)) add(rg.hi, "rgba(255,170,40,.95)", rn("上"), 3, 2);
+      if (near(rg.lo)) add(rg.lo, "rgba(255,170,40,.95)", rn("下"), 3, 2);
     }
 
     // 当前信号 / 持仓
@@ -825,6 +847,16 @@
   function renderSide() {
     const sym = state.active, d = state.data[sym];
     const sess = sessionOf(sym);
+    const lg = (c, t) => `<span><i style="background:${c}"></i>${t}</span>`;
+    setHtml("legend", state.chartTf === "15m"
+      ? lg("#f5c542", "EMA9") + lg("#4c8dff", "EMA21") +
+        '<span><i style="background:#26a69a"></i>/<i style="background:#ef5350"></i>Supertrend</span>' +
+        lg("rgba(0,217,255,.95)", "回归通道") +
+        '<span class="muted legend-note">▲▼ 信号 · ● 趋势转弱 · 红/绿 压力/支撑 · 紫 高周期位 · 🧱 强价位被拒</span>'
+      : lg("#f5c542", "EMA9") + lg("#4c8dff", "EMA21") +
+        '<span><i style="background:#26a69a"></i>/<i style="background:#ef5350"></i>Supertrend</span>' +
+        lg("rgba(0,217,255,.95)", "回归通道") + lg("rgba(255,170,40,.95)", "震荡区间") +
+        `<span class="muted legend-note">紫 高周期位 · 指标均为${(CHART_TF[state.chartTf] ?? CHART_TF["15m"]).label}周期 · 信号标记只画在 15m 图上</span>`);
     $("chartTitle").innerHTML = `${short(sym)} <span class="muted small">${CN_NAMES[sym] ?? ""} · ${MARKET_NAMES[marketOf(sym)]}永续 · ${(CHART_TF[state.chartTf] ?? CHART_TF["15m"]).label}${sess ? " · " + sess.txt : ""}</span>`;
     if (!d?.live) { setHtml("liveScore", `<span class="muted">${d?.error ?? "加载中…"}</span>`); return; }
     const L = d.live, p = d.res.params;
@@ -910,13 +942,20 @@
     const hBelow = hl.filter((l) => l.price <= px).sort((a, b) => b.price - a.price).slice(0, 3);
     const dRow = (l, cls, label) => `<div class="lv-row ${l.hard ? "lv-strong" : ""}"><span class="${cls}">${label}</span><span class="num">${fmtPrice(l.price)}</span><span class="muted num">${fmtPct(l.price, px)}</span><span class="muted small">${l.srcs.join("+")}${l.hard ? " · 硬" : ""}</span></div>`;
 
-    // 回归通道 + 震荡区间（当前选中的周期档位）
-    const cfg = CH_TF[state.chTf] ?? CH_TF["1d"];
+    // 回归通道 + 震荡区间。
+    // 主图在 4h/日线时，这里直接跟随主图 —— 两套独立的周期选择会让人以为
+    // 面板上的斜率/r² 是主图那条通道的，其实不是。主图是 15m 时主图没有自己的
+    // 通道，这时才保留独立选择。
+    const follow = state.chartTf !== "15m";
+    const panelTf = follow ? state.chartTf : state.chTf;
+    const cfg = CH_TF[panelTf] ?? CH_TF["1d"];
     const src = (d[cfg.key] ?? []).filter((x) => x.time + (cfg.key === "d1" ? 86400 : 4 * 3600) <= nowS);
     const ch = Levels.channel(src, cfg.n);
     const rg = Levels.regime(src, cfg.key === "d1" ? 30 : 90);
-    const tfBtn = (k) => `<button class="btn tf-btn${state.chTf === k ? " on" : ""}" data-chtf="${k}">${CH_TF[k].label}</button>`;
-    let chTxt = `<div class="sub-h">趋势通道 / 震荡区间 ${tfBtn("1d")}${tfBtn("4h")}</div>`;
+    const tfBtn = (k) => `<button class="btn tf-btn${panelTf === k ? " on" : ""}" data-chtf="${k}">${CH_TF[k].label}</button>`;
+    let chTxt = follow
+      ? `<div class="sub-h">趋势通道 / 震荡区间 <span class="muted small">跟随主图（${cfg.label}）</span></div>`
+      : `<div class="sub-h">趋势通道 / 震荡区间 ${tfBtn("1d")}${tfBtn("4h")}</div>`;
     if (ch && rg) {
       const pos = ch.lineAt(nowS);
       // 现价在通道里的相对位置：0 = 下沿，1 = 上沿
@@ -934,7 +973,7 @@
         `<span><b class="${rg.trending ? (rg.up ? "long" : "short") : "wait"}">${rg.trending ? (rg.up ? "趋势↑" : "趋势↓") : "震荡"}</b></span>` +
         `<span class="muted">效率比 ${rg.er.toFixed(2)}</span>` +
         `<span class="muted">${rg.trending ? "" : `区间 ${fmtPrice(rg.lo)}~${fmtPrice(rg.hi)}（宽 ${rg.widthPct.toFixed(1)}%）`}</span></div>` +
-        `<div class="muted small" style="margin-top:4px">通道是对 log 收盘价做最小二乘回归（${cfg.label} ${ch.n} 根），不是手连的趋势线：给定周期和窗口，结果唯一、可复现、能回测。r² 低说明"趋势"这个描述本身就不贴合当前走势，这时候通道只当波动范围看。<b>效率比</b>=净位移/路径总长，越接近 1 越单边。<b>这些阈值都没经过回测验证，不参与信号判定。</b></div>`;
+        `<div class="muted small" style="margin-top:4px">通道是对 log 收盘价做最小二乘回归（${cfg.label} ${ch.n} 根），不是手连的趋势线：给定周期和窗口，结果唯一、可复现、能回测。r² 低说明"趋势"这个描述本身就不贴合当前走势，这时候通道只当波动范围看。<b>效率比</b>=净位移/路径总长，越接近 1 越单边。<b>这些阈值都没经过回测验证，不参与信号判定。</b>${follow ? "" : "<br>当前主图是 15m，通道半宽 ±" + ch.bandPct.toFixed(0) + "% 远超 15m 的可见区间，所以图上基本看不到线 —— 点图表左上角的「4h」或「日线」就能看到整条通道。"}</div>`;
     } else {
       chTxt += '<span class="muted small">数据不足</span>';
     }
@@ -969,15 +1008,30 @@
     setHtml("liveScore", `<div class="score-cols">${col(1, L.long)}${col(-1, L.short)}</div>
       <div class="muted small" style="margin-top:6px">阈值 ${state.params.scoreThreshold} 分；还需满足 ADX≥${p.minAdx}、1h Supertrend 同向，并出现回踩确认或放量突破，K线收盘才算信号</div>`);
 
-    setHtml("indicatorBar", [
-      ["1h趋势", L.trend > 0 ? '<span class="long">向上</span>' : L.trend < 0 ? '<span class="short">向下</span>' : '<span class="muted">震荡</span>'],
-      ["RSI", L.rsi.toFixed(1)],
-      ["ADX", L.adx.toFixed(1)],
-      ["MACD柱", `<span class="${L.macdHist >= 0 ? "long" : "short"}">${fmtPrice(L.macdHist)}</span>`],
-      ["量比", `${L.volRatio.toFixed(2)}x`],
-      ["ATR", `${fmtPrice(L.atr)} (${L.atrPct.toFixed(2)}%)`],
-      ["手续费/止损", `${((p.feePct / 100) / (L.atrPct / 100) / 1.2).toFixed(2)}R`],
-    ].map(([k, v]) => `<span class="muted">${k}<b class="num" style="color:var(--text)">${v}</b></span>`).join(""));
+    // 指标条：数值必须和主图周期一致。高周期时用 chartStats（renderChart 里现算的），
+    // 并且去掉「手续费/止损」—— 那一项是 15m 策略的止损宽度口径，在日线图上没有意义
+    const S = chartStats;
+    const arrowTxt = (v) => (v > 0 ? '<span class="long">向上</span>' : v < 0 ? '<span class="short">向下</span>' : '<span class="muted">震荡</span>');
+    const rows = S
+      ? [
+          [`${S.tf}周期`, '<span class="muted">以下均为该周期</span>'],
+          ["Supertrend", arrowTxt(S.stDir)],
+          ["RSI", isFinite(S.rsi) ? S.rsi.toFixed(1) : "-"],
+          ["ADX", isFinite(S.adx) ? S.adx.toFixed(1) : "-"],
+          ["MACD柱", `<span class="${S.macdHist >= 0 ? "long" : "short"}">${fmtPrice(S.macdHist)}</span>`],
+          ["量比", isFinite(S.volRatio) ? `${S.volRatio.toFixed(2)}x` : "-"],
+          ["ATR", `${fmtPrice(S.atr)} (${S.atrPct.toFixed(2)}%)`],
+        ]
+      : [
+          ["1h趋势", arrowTxt(L.trend)],
+          ["RSI", L.rsi.toFixed(1)],
+          ["ADX", L.adx.toFixed(1)],
+          ["MACD柱", `<span class="${L.macdHist >= 0 ? "long" : "short"}">${fmtPrice(L.macdHist)}</span>`],
+          ["量比", `${L.volRatio.toFixed(2)}x`],
+          ["ATR", `${fmtPrice(L.atr)} (${L.atrPct.toFixed(2)}%)`],
+          ["手续费/止损", `${((p.feePct / 100) / (L.atrPct / 100) / 1.2).toFixed(2)}R`],
+        ];
+    setHtml("indicatorBar", rows.map(([k, v]) => `<span class="muted">${k}<b class="num" style="color:var(--text)">${v}</b></span>`).join(""));
 
     // 大周期分组统计：本机累计的全部品种已平仓信号
     const all = Object.values(journal);

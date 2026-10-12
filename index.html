@@ -12,7 +12,7 @@
   <link rel="icon" href="icon.svg" type="image/svg+xml" />
   <link rel="apple-touch-icon" href="icon.svg" />
   <title>盯盘助手 MTF · 多周期</title>
-  <link rel="stylesheet" href="css/style.css?v=5" />
+  <link rel="stylesheet" href="css/style.css?v=6" />
 </head>
 <body>
   <header class="topbar">
@@ -48,13 +48,7 @@
           <button class="btn tf-btn" data-ctf="4h">4h</button>
           <button class="btn tf-btn" data-ctf="1d">日线</button>
         </div>
-        <div class="legend">
-          <span><i style="background:#f5c542"></i>EMA9</span>
-          <span><i style="background:#4c8dff"></i>EMA21</span>
-          <span><i style="background:#26a69a"></i>/<i style="background:#ef5350"></i>Supertrend</span>
-          <span><i style="background:rgba(0,217,255,.95)"></i>回归通道</span>
-          <span class="muted">▲▼ 信号 · ● 趋势转弱 · 红/绿 压力/支撑 · 紫 高周期位 · 🧱 强价位被拒</span>
-        </div>
+        <div class="legend" id="legend"></div>
       </div>
       <div id="ohlc" class="ohlc num"></div>
       <div id="chart" class="chart"></div>
@@ -134,10 +128,10 @@
   </div>
 
   <script src="js/vendor/lightweight-charts.js"></script>
-  <script src="js/indicators.js?v=5"></script>
-  <script src="js/levels.js?v=5"></script>
-  <script src="js/strategy.js?v=5"></script>
-  <script src="js/push.js?v=5"></script>
-  <script src="js/app.js?v=5"></script>
+  <script src="js/indicators.js?v=6"></script>
+  <script src="js/levels.js?v=6"></script>
+  <script src="js/strategy.js?v=6"></script>
+  <script src="js/push.js?v=6"></script>
+  <script src="js/app.js?v=6"></script>
 </body>
 </html>
