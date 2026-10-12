@@ -506,8 +506,14 @@
     stUpS = chart.addLineSeries({ ...lineOpt, color: "#26a69a", lineWidth: 2, lineStyle: 2 });
     stDnS = chart.addLineSeries({ ...lineOpt, color: "#ef5350", lineWidth: 2, lineStyle: 2 });
     // 回归通道：淡青色。中轴虚线、上下沿点线，刻意做得比 EMA/Supertrend 弱，
-    // 避免把这个"仅供参考、未经回测"的东西画得比真正驱动信号的指标还显眼
-    const chOpt = { ...lineOpt, color: "rgba(120,200,220,.55)" };
+    // 避免把这个"仅供参考、未经回测"的东西画得比真正驱动信号的指标还显眼。
+    //
+    // autoscaleInfoProvider 返回 null = 不参与价格轴自动缩放。**这一条是必须的**：
+    // 日线通道半宽 ±11%，而 15m 图可见区间只有 2~3%。不排除的话价格轴会被拉到
+    // 覆盖整个通道（实测 74000~98000），K 线被压成一条线，图就废了。
+    // 代价是价格离通道远时看不到这三条线 —— 但那正是它不重要的时候；
+    // 价格真的贴近通道边缘时线会自己出现，而具体数值面板里一直有。
+    const chOpt = { ...lineOpt, color: "rgba(120,200,220,.55)", autoscaleInfoProvider: () => null };
     chMidS = chart.addLineSeries({ ...chOpt, lineWidth: 1, lineStyle: 2 });
     chUpS = chart.addLineSeries({ ...chOpt, lineWidth: 1, lineStyle: 1 });
     chDnS = chart.addLineSeries({ ...chOpt, lineWidth: 1, lineStyle: 1 });
@@ -650,11 +656,14 @@
       chMidS.setData([]); chUpS.setData([]); chDnS.setData([]);
     }
 
-    // 震荡区间：只在判定为震荡时画上下沿（趋势里画区间会误导）
+    // 震荡区间：只在判定为震荡时画上下沿（趋势里画区间会误导）。
+    // 另外只画离现价 6 ATR 以内的那一条 —— 日线区间常宽到 ±20%，两条都画会把
+    // 价格轴拉开好几倍（和通道同一个问题），而且远端那条对当下没有参考价值。
+    // 完整区间数值在右侧面板里一直显示。
     const rg = Levels.regime(chSrc, chCfg.key === "d1" ? 30 : 90);
     if (rg && !rg.trending) {
-      add(rg.hi, "rgba(245,166,35,.6)", `${chCfg.label}震荡上沿`, 3, 1);
-      add(rg.lo, "rgba(245,166,35,.6)", `${chCfg.label}震荡下沿`, 3, 1);
+      if (Math.abs(rg.hi - pxNow) <= 6 * atrNow) add(rg.hi, "rgba(245,166,35,.6)", `${chCfg.label}震荡上沿`, 3, 1);
+      if (Math.abs(rg.lo - pxNow) <= 6 * atrNow) add(rg.lo, "rgba(245,166,35,.6)", `${chCfg.label}震荡下沿`, 3, 1);
     }
 
     // 当前信号 / 持仓
