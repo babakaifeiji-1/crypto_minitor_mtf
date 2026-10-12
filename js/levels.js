@@ -202,33 +202,37 @@ const Levels = (() => {
   // 用回归而不是手连趋势线，是因为手连趋势线要选锚点 —— 换两个点整条线就变了，
   // 不可复现也无法回测。回归通道是确定性的：给定 K 线和窗口长度，结果唯一。
   // 取 log 价格使通道上下在百分比意义上等宽（线性价格会让下沿被压扁）。
-  function channel(k, n, barSec, mult = 2) {
+  //
+  // 自变量用**真实时间（天）**而不是K线序号，这样才能把日线/4h 的通道求值到
+  // 15m 图的时间点上画出来（序号回归没法跨周期投影），顺带也不怕数据缺口。
+  function channel(k, n, mult = 2) {
     const w = (k || []).slice(-n);
     if (w.length < 10) return null;
-    const N = w.length;
-    const y = w.map((x) => Math.log(x.close));
-    const xm = (N - 1) / 2, ym = y.reduce((a, b) => a + b, 0) / N;
+    const N = w.length, t0 = w[0].time;
+    const x = w.map((b) => (b.time - t0) / 86400);
+    const y = w.map((b) => Math.log(b.close));
+    const xm = x.reduce((a, b) => a + b, 0) / N, ym = y.reduce((a, b) => a + b, 0) / N;
     let sxy = 0, sxx = 0;
-    for (let i = 0; i < N; i++) { sxy += (i - xm) * (y[i] - ym); sxx += (i - xm) * (i - xm); }
+    for (let i = 0; i < N; i++) { sxy += (x[i] - xm) * (y[i] - ym); sxx += (x[i] - xm) ** 2; }
     if (sxx === 0) return null;
-    const b = sxy / sxx, a = ym - b * xm;
+    const bPerDay = sxy / sxx, a = ym - bPerDay * xm;
     let ssr = 0, sst = 0;
-    for (let i = 0; i < N; i++) { const f = a + b * i; ssr += (y[i] - f) ** 2; sst += (y[i] - ym) ** 2; }
+    for (let i = 0; i < N; i++) { const f = a + bPerDay * x[i]; ssr += (y[i] - f) ** 2; sst += (y[i] - ym) ** 2; }
     const sigma = Math.sqrt(ssr / Math.max(1, N - 2));
     const r2 = sst > 0 ? 1 - ssr / sst : 0;
-    const barsPerDay = 86400 / barSec;
+    // 在任意时间点求通道三条线的价格。超出拟合窗口就是外推，调用方自己决定外推多远。
+    const lineAt = (timeSec) => {
+      const f = a + bPerDay * ((timeSec - t0) / 86400);
+      return { mid: Math.exp(f), up: Math.exp(f + mult * sigma), dn: Math.exp(f - mult * sigma) };
+    };
     return {
-      // 每根K线一个点，供图表画三条斜线
-      points: w.map((x, i) => ({
-        time: x.time,
-        mid: Math.exp(a + b * i),
-        up: Math.exp(a + b * i + mult * sigma),
-        dn: Math.exp(a + b * i - mult * sigma),
-      })),
-      r2,                                                  // 拟合度：越高说明"趋势"这个描述越贴合
-      pctPerDay: (Math.exp(b * barsPerDay) - 1) * 100,     // 中轴日斜率（%）
-      bandPct: (Math.exp(mult * sigma) - 1) * 100,         // 通道半宽（%）
-      slopeUp: b > 0,
+      lineAt,
+      points: w.map((b) => ({ time: b.time, ...lineAt(b.time) })),
+      r2,                                              // 拟合度：越高说明"趋势"这个描述越贴合
+      pctPerDay: (Math.exp(bPerDay) - 1) * 100,        // 中轴日斜率（%）
+      bandPct: (Math.exp(mult * sigma) - 1) * 100,     // 通道半宽（%）
+      slopeUp: bPerDay > 0,
+      from: w[0].time, to: w[N - 1].time,
       n: N,
     };
   }
