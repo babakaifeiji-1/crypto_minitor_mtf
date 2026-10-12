@@ -80,7 +80,10 @@ html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
 .card .del { position: absolute; top: 2px; right: 6px; color: var(--muted); display: none; font-size: 12px; }
 .card:hover .del { display: block; }
 
-.chart-head { display: flex; justify-content: space-between; align-items: center; padding: 6px 12px; border-bottom: 1px solid var(--line); }
+.chart-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 6px 12px; border-bottom: 1px solid var(--line); }
+.chart-head .chart-title { flex: 0 0 auto; }
+.chart-head .legend { flex: 1 1 auto; min-width: 0; overflow: hidden; }
+.chart-head .legend span { white-space: nowrap; }
 .chart-title { font-weight: 700; font-size: 14px; }
 .legend { display: flex; gap: 12px; font-size: 11px; color: var(--muted); }
 .legend i { display: inline-block; width: 10px; height: 3px; vertical-align: middle; margin-right: 3px; }
@@ -134,6 +137,9 @@ html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
 .sub-h { font-size: 12px; font-weight: 600; margin: 10px 0 4px; }
 /* 趋势通道周期切换：跟在 sub-h 后面的小按钮 */
 .tf-btn { padding: 1px 7px; font-size: 11px; margin-left: 4px; font-weight: 400; }
+/* 主图周期切换 */
+.chart-tf { display: flex; gap: 4px; align-items: center; flex: 0 0 auto; }
+.chart-tf .tf-btn { margin-left: 0; padding: 2px 9px; font-size: 12px; white-space: nowrap; }
 .tf-line .long, .tf-line .short, .tf-line .wait { font-weight: 600; }
 .ctx-grid { display: grid; grid-template-columns: 1.4fr 1fr 1fr 1fr; gap: 3px 8px; font-size: 12px; }
 

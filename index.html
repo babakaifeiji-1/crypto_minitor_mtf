@@ -43,11 +43,17 @@
     <section class="center" id="chartSection">
       <div class="chart-head">
         <div id="chartTitle" class="chart-title"></div>
+        <div class="chart-tf" id="chartTf">
+          <button class="btn tf-btn" data-ctf="15m">15m</button>
+          <button class="btn tf-btn" data-ctf="4h">4h</button>
+          <button class="btn tf-btn" data-ctf="1d">日线</button>
+        </div>
         <div class="legend">
           <span><i style="background:#f5c542"></i>EMA9</span>
           <span><i style="background:#4c8dff"></i>EMA21</span>
           <span><i style="background:#26a69a"></i>/<i style="background:#ef5350"></i>Supertrend</span>
-          <span class="muted">▲▼ 信号 · ● 趋势转弱 · 红/绿 压力/支撑 · 紫 日线位 · 🧱 强价位被拒</span>
+          <span><i style="background:rgba(120,200,220,.8)"></i>回归通道</span>
+          <span class="muted">▲▼ 信号 · ● 趋势转弱 · 红/绿 压力/支撑 · 紫 高周期位 · 🧱 强价位被拒</span>
         </div>
       </div>
       <div id="ohlc" class="ohlc num"></div>
