@@ -54,6 +54,7 @@
     sound: false,
     feed: [],
     flashUntil: {}, // sym -> 时间戳，卡片闪烁
+    chTf: store.load("chTf", "1d"), // 回归通道 / 震荡区间的周期档位："1d" 或 "4h"
   };
   state.active = state.symbols[0];
 
@@ -475,6 +476,8 @@
 
   // ---------------- 图表 ----------------
   let chart, candle, vol, ema9S, ema21S, stUpS, stDnS, priceLines = [];
+  // 高周期回归通道（中轴 + 上下沿）。日线/4h 上拟合，投影到 15m 图
+  let chMidS, chUpS, chDnS;
   function initChart() {
     chart = LightweightCharts.createChart($("chart"), {
       layout: { background: { color: "#0e1117" }, textColor: "#9aa3b5" },
@@ -500,7 +503,20 @@
     ema21S = chart.addLineSeries({ ...lineOpt, color: "#4c8dff" });
     stUpS = chart.addLineSeries({ ...lineOpt, color: "#26a69a", lineWidth: 2, lineStyle: 2 });
     stDnS = chart.addLineSeries({ ...lineOpt, color: "#ef5350", lineWidth: 2, lineStyle: 2 });
+    // 回归通道：淡青色。中轴虚线、上下沿点线，刻意做得比 EMA/Supertrend 弱，
+    // 避免把这个"仅供参考、未经回测"的东西画得比真正驱动信号的指标还显眼
+    const chOpt = { ...lineOpt, color: "rgba(120,200,220,.55)" };
+    chMidS = chart.addLineSeries({ ...chOpt, lineWidth: 1, lineStyle: 2 });
+    chUpS = chart.addLineSeries({ ...chOpt, lineWidth: 1, lineStyle: 1 });
+    chDnS = chart.addLineSeries({ ...chOpt, lineWidth: 1, lineStyle: 1 });
   }
+
+  // 通道周期档位：日线 60 根（约两个月）/ 4h 180 根（约一个月）
+  // 15m 图上看日线通道是"大结构"，4h 通道是"中结构"，都比 15m 自己连趋势线有意义
+  const CH_TF = {
+    "1d": { label: "日线", n: 60, key: "d1" },
+    "4h": { label: "4h", n: 180, key: "h4" },
+  };
 
   // 大周期方向：取当前（含未收盘）K线的 Supertrend
   function ctxNow(d) {
@@ -603,12 +619,41 @@
     kl.above.forEach((l) => drawLv(l, true));
     kl.below.forEach((l) => drawLv(l, false));
 
-    // 日线关键位（紫色，较粗）
+    // 高周期关键位（4h + 日线）。硬位（日线/周高低参与）紫色粗线，软位（纯 4h）灰紫细线
     const pxNow = k[k.length - 1].close, atrNow = ind.atr[ind.atr.length - 1];
-    const dLv = Levels.daily(d.d1, Date.now() / 1000).filter((l) => Math.abs(l.price - pxNow) <= 15 * atrNow);
-    [...dLv.filter((l) => l.price > pxNow).sort((a, b) => a.price - b.price).slice(0, 2),
-     ...dLv.filter((l) => l.price <= pxNow).sort((a, b) => b.price - a.price).slice(0, 2)]
-      .forEach((l) => add(l.price, "rgba(179,136,255,.75)", l.price > pxNow ? "日线压力" : "日线支撑", 0, 2));
+    const nowSec = Date.now() / 1000;
+    const hLv = Levels.htf(d.h4, d.d1, nowSec).filter((l) => Math.abs(l.price - pxNow) <= 15 * atrNow);
+    const pick = (arr, n) => arr.slice(0, n);
+    [...pick(hLv.filter((l) => l.price > pxNow).sort((a, b) => a.price - b.price), 3),
+     ...pick(hLv.filter((l) => l.price <= pxNow).sort((a, b) => b.price - a.price), 3)]
+      .forEach((l) => {
+        const isRes = l.price > pxNow;
+        add(l.price,
+          l.hard ? "rgba(179,136,255,.8)" : "rgba(179,136,255,.4)",
+          `${l.srcs.join("+")}${isRes ? "压力" : "支撑"}`,
+          0, l.hard ? 2 : 1);
+      });
+
+    // 高周期回归通道，投影到 15m 时间轴上
+    const chCfg = CH_TF[state.chTf] ?? CH_TF["1d"];
+    const chSrc = (d[chCfg.key] ?? []).filter((x) => x.time + (chCfg.key === "d1" ? 86400 : 4 * 3600) <= nowSec);
+    const ch = Levels.channel(chSrc, chCfg.n);
+    if (ch) {
+      // 只画在拟合窗口内的部分，不外推 —— 外推的通道会给人虚假的"目标位"暗示
+      const proj = (f) => k.map((x) => (x.time >= ch.from ? { time: T(x.time), value: f(ch.lineAt(x.time)) } : { time: T(x.time) }));
+      chMidS.setData(proj((v) => v.mid));
+      chUpS.setData(proj((v) => v.up));
+      chDnS.setData(proj((v) => v.dn));
+    } else {
+      chMidS.setData([]); chUpS.setData([]); chDnS.setData([]);
+    }
+
+    // 震荡区间：只在判定为震荡时画上下沿（趋势里画区间会误导）
+    const rg = Levels.regime(chSrc, chCfg.key === "d1" ? 30 : 90);
+    if (rg && !rg.trending) {
+      add(rg.hi, "rgba(245,166,35,.6)", `${chCfg.label}震荡上沿`, 3, 1);
+      add(rg.lo, "rgba(245,166,35,.6)", `${chCfg.label}震荡下沿`, 3, 1);
+    }
 
     // 当前信号 / 持仓
     const last = d.res.signals[d.res.signals.length - 1], st = d.lastStatus;
@@ -802,18 +847,51 @@
     const tfLine = (name, x) => x
       ? `<div class="tf-line"><span>${name}</span><span>Supertrend ${arrow(x.st)}</span><span>EMA20/50 ${arrow(x.stack)}</span><span>价格${x.px20 > 0 ? "在EMA20上" : "在EMA20下"}</span></div>`
       : `<div class="tf-line"><span>${name}</span><span class="muted">数据不足</span></div>`;
-    const dl = Levels.daily(d.d1, Date.now() / 1000), px = d.ltf[d.ltf.length - 1].close;
-    const dAbove = dl.filter((l) => l.price > px).sort((a, b) => a.price - b.price).slice(0, 2);
-    const dBelow = dl.filter((l) => l.price <= px).sort((a, b) => b.price - a.price).slice(0, 2);
-    const dRow = (l, cls, label) => `<div class="lv-row"><span class="${cls}">${label}</span><span class="num">${fmtPrice(l.price)}</span><span class="muted num">${fmtPct(l.price, px)}</span><span class="muted small">${l.touches}次</span></div>`;
+    const nowS = Date.now() / 1000;
+    const px = d.ltf[d.ltf.length - 1].close;
+    const hl = Levels.htf(d.h4, d.d1, nowS);
+    const hAbove = hl.filter((l) => l.price > px).sort((a, b) => a.price - b.price).slice(0, 3);
+    const hBelow = hl.filter((l) => l.price <= px).sort((a, b) => b.price - a.price).slice(0, 3);
+    const dRow = (l, cls, label) => `<div class="lv-row ${l.hard ? "lv-strong" : ""}"><span class="${cls}">${label}</span><span class="num">${fmtPrice(l.price)}</span><span class="muted num">${fmtPct(l.price, px)}</span><span class="muted small">${l.srcs.join("+")}${l.hard ? " · 硬" : ""}</span></div>`;
+
+    // 回归通道 + 震荡区间（当前选中的周期档位）
+    const cfg = CH_TF[state.chTf] ?? CH_TF["1d"];
+    const src = (d[cfg.key] ?? []).filter((x) => x.time + (cfg.key === "d1" ? 86400 : 4 * 3600) <= nowS);
+    const ch = Levels.channel(src, cfg.n);
+    const rg = Levels.regime(src, cfg.key === "d1" ? 30 : 90);
+    const tfBtn = (k) => `<button class="btn tf-btn${state.chTf === k ? " on" : ""}" data-chtf="${k}">${CH_TF[k].label}</button>`;
+    let chTxt = `<div class="sub-h">趋势通道 / 震荡区间 ${tfBtn("1d")}${tfBtn("4h")}</div>`;
+    if (ch && rg) {
+      const pos = ch.lineAt(nowS);
+      // 现价在通道里的相对位置：0 = 下沿，1 = 上沿
+      const posPct = (px - pos.dn) / (pos.up - pos.dn) * 100;
+      const fit = ch.r2 >= 0.5 ? "贴合" : ch.r2 >= 0.2 ? "一般" : "很差";
+      chTxt +=
+        `<div class="tf-line"><span>${cfg.label}通道</span>` +
+        `<span>斜率 <b class="${ch.pctPerDay >= 0 ? "long" : "short"}">${ch.pctPerDay >= 0 ? "+" : ""}${ch.pctPerDay.toFixed(2)}%/日</b></span>` +
+        `<span class="muted">r²=${ch.r2.toFixed(2)}（${fit}）</span>` +
+        `<span class="muted">半宽 ±${ch.bandPct.toFixed(1)}%</span></div>` +
+        `<div class="tf-line"><span>现价位置</span><span>${posPct.toFixed(0)}% ` +
+        `<span class="muted">(0=下沿 100=上沿)</span></span>` +
+        `<span class="muted">上沿 ${fmtPrice(pos.up)} / 下沿 ${fmtPrice(pos.dn)}</span></div>` +
+        `<div class="tf-line"><span>${cfg.label}形态</span>` +
+        `<span><b class="${rg.trending ? (rg.up ? "long" : "short") : "wait"}">${rg.trending ? (rg.up ? "趋势↑" : "趋势↓") : "震荡"}</b></span>` +
+        `<span class="muted">效率比 ${rg.er.toFixed(2)}</span>` +
+        `<span class="muted">${rg.trending ? "" : `区间 ${fmtPrice(rg.lo)}~${fmtPrice(rg.hi)}（宽 ${rg.widthPct.toFixed(1)}%）`}</span></div>` +
+        `<div class="muted small" style="margin-top:4px">通道是对 log 收盘价做最小二乘回归（${cfg.label} ${ch.n} 根），不是手连的趋势线：给定周期和窗口，结果唯一、可复现、能回测。r² 低说明"趋势"这个描述本身就不贴合当前走势，这时候通道只当波动范围看。<b>效率比</b>=净位移/路径总长，越接近 1 越单边。<b>这些阈值都没经过回测验证，不参与信号判定。</b></div>`;
+    } else {
+      chTxt += '<span class="muted small">数据不足</span>';
+    }
+
     setHtml("bigPicture",
       tfLine("日线", c.d1) + tfLine("4h", c.h4) +
       `<div class="tf-line"><span>1h</span><span>趋势 ${arrow(c.h1)}</span><span class="muted">（信号方向过滤用的就是它）</span></div>` +
       (ph ? `<div class="phase ${ph.cls}">${ph.txt}</div>` : "") +
-      `<div class="sub-h">日线关键位（近 90 天摆动点 + 近 7 日高低）</div>` +
-      ([...dAbove].reverse().map((l) => dRow(l, "short", "日线压力")).join("") +
-        dBelow.map((l) => dRow(l, "long", "日线支撑")).join("") || '<span class="muted small">数据不足</span>') +
-      `<div class="muted small" style="margin-top:4px">仅供参考，不参与信号判定。回测显示把日线/4h 方向当硬过滤并不稳定，见下方「大周期分组统计」持续观察。</div>`);
+      chTxt +
+      `<div class="sub-h">高周期关键位（4h 摆动点 + 日线摆动点 + 周高低）</div>` +
+      ([...hAbove].reverse().map((l) => dRow(l, "short", "压力")).join("") +
+        hBelow.map((l) => dRow(l, "long", "支撑")).join("") || '<span class="muted small">数据不足</span>') +
+      `<div class="muted small" style="margin-top:4px">"硬"= 日线或周高低参与过的位，粗紫线；纯 4h 堆出来的是软位，细线。比原版只看 15m/1h 位更不容易被插针扫掉，但<b>回测显示把前方有压力当成不开仓的理由会让每笔从 -0.06R 恶化到 -0.29R</b>——趋势里价格本来就在不断破位。所以这里只做展示和止损参考，不参与方向判定。</div>`);
 
     // 关键价位
     const kl = keyLevels(d, 3);
@@ -911,6 +989,17 @@
       if (card) selectSymbol(card.dataset.sym);
     });
     $("feed").addEventListener("click", (e) => { const it = e.target.closest(".item"); if (it) selectSymbol(it.dataset.sym); });
+
+    // 趋势通道 / 震荡区间的周期切换（日线 / 4h）
+    $("bigPicture").addEventListener("click", (e) => {
+      const b = e.target.closest("[data-chtf]");
+      if (!b || !CH_TF[b.dataset.chtf]) return;
+      state.chTf = b.dataset.chtf;
+      store.save("chTf", state.chTf);
+      htmlCache.bigPicture = null; // setHtml 有缓存，强制重画
+      renderSide();
+      renderChart();
+    });
 
     const th = $("threshold");
     th.value = state.params.scoreThreshold;

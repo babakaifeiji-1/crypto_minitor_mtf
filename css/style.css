@@ -132,6 +132,9 @@ html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
 .tf-line { display: grid; grid-template-columns: 38px 1fr 1fr 1.2fr; gap: 6px; font-size: 12px; padding: 2px 0; }
 .phase { margin: 6px 0 2px; font-size: 12px; padding: 3px 7px; border-radius: 4px; background: var(--panel2); }
 .sub-h { font-size: 12px; font-weight: 600; margin: 10px 0 4px; }
+/* 趋势通道周期切换：跟在 sub-h 后面的小按钮 */
+.tf-btn { padding: 1px 7px; font-size: 11px; margin-left: 4px; font-weight: 400; }
+.tf-line .long, .tf-line .short, .tf-line .wait { font-weight: 600; }
 .ctx-grid { display: grid; grid-template-columns: 1.4fr 1fr 1fr 1fr; gap: 3px 8px; font-size: 12px; }
 
 /* ---------- 推送设置弹窗 ---------- */

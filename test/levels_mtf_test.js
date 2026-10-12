@@ -83,7 +83,7 @@ for (const sym of SYMS) {
   ok(futureHits.length === 0, `${sym} htf 在历史时点引用了未来K线极值（${futureHits.length} 处）`);
 
   // ── channel ──────────────────────────────────────────────────────────────
-  const ch = L.channel(d1, 60, 86400);
+  const ch = L.channel(d1, 60);
   ok(ch !== null, `${sym} channel 返回 null`);
   if (ch) {
     ok(ch.points.length === Math.min(60, d1.length), `${sym} channel 点数不对`);
@@ -97,18 +97,42 @@ for (const sym of SYMS) {
       return c >= p.dn && c <= p.up;
     }).length / ch.points.length;
     ok(inside > 0.8, `${sym} channel ±2σ 覆盖率过低: ${(inside * 100).toFixed(0)}%`);
+
+    // lineAt 跨周期投影：这是把日线通道画到 15m 图上的关键
+    ok(typeof ch.lineAt === 'function', `${sym} channel 缺 lineAt`);
+    const mid0 = ch.lineAt(ch.from), midN = ch.lineAt(ch.to);
+    ok(Math.abs(mid0.mid - ch.points[0].mid) < mid0.mid * 1e-9, `${sym} lineAt 与 points 首点不一致`);
+    ok(Math.abs(midN.mid - ch.points[ch.points.length - 1].mid) < midN.mid * 1e-9, `${sym} lineAt 与 points 末点不一致`);
+    // 在任意 15m 时刻求值都要有限且有序
+    const probes = [ch.from, ch.from + 1234, (ch.from + ch.to) / 2, ch.to, ch.to + 3 * 86400];
+    ok(probes.every((t) => { const v = ch.lineAt(t); return isFinite(v.mid) && v.dn < v.mid && v.mid < v.up; }),
+      `${sym} lineAt 在探测点上非法`);
+    // 斜率方向自洽：末点中轴应与 slopeUp 一致
+    ok((midN.mid > mid0.mid) === ch.slopeUp || Math.abs(ch.pctPerDay) < 1e-9,
+      `${sym} slopeUp 与中轴走向不一致`);
+    // 带宽比例在中轴任意点都应恒定（log 空间等宽）
+    ok(probes.every((t) => { const v = ch.lineAt(t); return Math.abs((v.up / v.mid) - (ch.bandPct / 100 + 1)) < 1e-9; }),
+      `${sym} 通道上沿/中轴比例不恒定`);
+
     console.log(`  channel(日线60): r²=${ch.r2.toFixed(2)}  斜率 ${ch.pctPerDay >= 0 ? '+' : ''}${ch.pctPerDay.toFixed(2)}%/日  ` +
       `半宽 ±${ch.bandPct.toFixed(1)}%  ±2σ 覆盖 ${(inside * 100).toFixed(0)}%`);
   }
   // 窗口太短要返回 null，不能崩
-  ok(L.channel(d1.slice(-5), 60, 86400) === null, `${sym} channel 短窗口未返回 null`);
-  ok(L.channel([], 60, 86400) === null, `${sym} channel 空数组未返回 null`);
+  ok(L.channel(d1.slice(-5), 60) === null, `${sym} channel 短窗口未返回 null`);
+  ok(L.channel([], 60) === null, `${sym} channel 空数组未返回 null`);
 
-  // 人造纯线性序列 → r² 应接近 1，斜率应可还原
+  // 人造纯指数序列 → r² 应接近 1，日斜率应可还原
   const synth = Array.from({ length: 50 }, (_, i) => ({ time: i * 86400, close: 100 * Math.exp(0.01 * i), high: 0, low: 0 }));
-  const cs = L.channel(synth, 50, 86400);
+  const cs = L.channel(synth, 50);
   ok(cs.r2 > 0.999, `合成序列 r² 应≈1，实际 ${cs.r2}`);
   ok(Math.abs(cs.pctPerDay - (Math.exp(0.01) - 1) * 100) < 0.01, `合成序列斜率还原失败: ${cs.pctPerDay}`);
+  // 4h 周期上算的通道，求值到 15m 时间点也必须连续（跨周期投影的核心用法）
+  const ch4 = L.channel(h4, 180);
+  if (ch4) {
+    const t = h4[h4.length - 1].time;
+    const a = ch4.lineAt(t), b = ch4.lineAt(t + 900);
+    ok(Math.abs(b.mid / a.mid - 1) < 0.02, `${sym} 4h 通道在 15m 步长上跳变过大`);
+  }
 
   // ── regime ───────────────────────────────────────────────────────────────
   const rg = L.regime(d1, 30);
@@ -124,7 +148,7 @@ for (const sym of SYMS) {
 
   // 15m 上也要能跑（app 会在多个周期调用）
   if (m15.length > 100) {
-    ok(L.channel(m15, 96, 900) !== null, `${sym} channel 在 15m 上失败`);
+    ok(L.channel(m15, 96) !== null, `${sym} channel 在 15m 上失败`);
     ok(L.regime(m15, 96) !== null, `${sym} regime 在 15m 上失败`);
   }
 }
