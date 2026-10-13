@@ -479,9 +479,126 @@
   }
 
   // ---------------- 图表 ----------------
+  // 自绘图层（lightweight-charts v4.2 primitive）：通道填充、震荡区间框、从形成点开始的价位线。
+  // 原生 price line 只能横贯整张图，画出来就像"这个位一直存在"——对历史K线来说是假的。
+  class StructLayer {
+    constructor(z) { this._z = z; this._d = { bands: [], boxes: [], segs: [], vlines: [] }; this._views = [this]; }
+    attached(p) { this._chart = p.chart; this._series = p.series; this._req = p.requestUpdate; }
+    detached() { this._chart = this._series = null; }
+    set(d) { this._d = d; this._req?.(); }
+    // ---- view ----
+    updateAllViews() {
+      const ts = this._chart?.timeScale(), s = this._series;
+      if (!ts || !s) { this._g = null; return; }
+      const X = (t) => ts.timeToCoordinate(t), Y = (p) => s.priceToCoordinate(p), d = this._d;
+      this._g = {
+        bands: d.bands.map((b) => ({ fill: b.fill, pts: b.pts.map((p) => ({ x: X(p.time), u: Y(p.up), l: Y(p.dn) })).filter((p) => p.x != null && p.u != null && p.l != null) })),
+        boxes: d.boxes.map((b) => ({ ...b, x0: X(b.t0), x1: X(b.t1), y0: Y(b.hi), y1: Y(b.lo) })),
+        segs: d.segs.map((g) => ({ ...g, x0: X(g.t0), x1: X(g.t1), y: Y(g.price) })),
+        vlines: d.vlines.map((v) => ({ ...v, x: X(v.time) })),
+      };
+    }
+    paneViews() { return this._views; }
+    zOrder() { return this._z; }
+    renderer() { return this; }
+    // ---- renderer ----
+    draw(target) {
+      const g = this._g;
+      if (!g) return;
+      target.useBitmapCoordinateSpace(({ context: c, horizontalPixelRatio: hr, verticalPixelRatio: vr, bitmapSize }) => {
+        const bottom = this._z === "bottom";
+        if (bottom) {
+          for (const b of g.bands) {
+            if (b.pts.length < 2) continue;
+            c.beginPath();
+            b.pts.forEach((p, i) => (i ? c.lineTo(p.x * hr, p.u * vr) : c.moveTo(p.x * hr, p.u * vr)));
+            for (let i = b.pts.length - 1; i >= 0; i--) c.lineTo(b.pts[i].x * hr, b.pts[i].l * vr);
+            c.closePath(); c.fillStyle = b.fill; c.fill();
+          }
+          for (const b of g.boxes) {
+            if (b.x0 == null || b.x1 == null || b.y0 == null || b.y1 == null || !b.fill) continue;
+            c.fillStyle = b.fill;
+            c.fillRect(b.x0 * hr, b.y0 * vr, (b.x1 - b.x0) * hr, (b.y1 - b.y0) * vr);
+          }
+          return;
+        }
+        c.save();
+        for (const s of g.segs) {
+          if (s.x0 == null || s.x1 == null || s.y == null) continue;
+          c.strokeStyle = s.color; c.lineWidth = Math.max(1, s.width * hr);
+          c.setLineDash(s.dash ? [6 * hr, 4 * hr] : []);
+          c.beginPath(); c.moveTo(s.x0 * hr, Math.round(s.y * vr) + 0.5); c.lineTo(s.x1 * hr, Math.round(s.y * vr) + 0.5); c.stroke();
+        }
+        c.setLineDash([]);
+        for (const b of g.boxes) {
+          if (b.x0 == null || b.x1 == null || b.y0 == null || b.y1 == null) continue;
+          c.strokeStyle = b.stroke; c.lineWidth = 2 * hr;
+          for (const y of [b.y0, b.y1]) { c.beginPath(); c.moveTo(b.x0 * hr, y * vr); c.lineTo(b.x1 * hr, y * vr); c.stroke(); }
+          c.lineWidth = 1 * hr; c.setLineDash([3 * hr, 3 * hr]);
+          c.beginPath(); c.moveTo(b.x0 * hr, b.y0 * vr); c.lineTo(b.x0 * hr, b.y1 * vr); c.stroke(); c.setLineDash([]);
+          if (b.label) {
+            c.font = `600 ${11 * vr}px -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif`;
+            const tw = c.measureText(b.label).width, px = b.x0 * hr + 6 * hr, py = b.y0 * vr + 5 * vr;
+            c.fillStyle = "rgba(14,17,23,.82)"; c.fillRect(px - 3 * hr, py, tw + 6 * hr, 16 * vr);
+            c.fillStyle = b.stroke; c.textBaseline = "top"; c.fillText(b.label, px, py + 2.5 * vr);
+          }
+        }
+        for (const v of g.vlines) {
+          if (v.x == null) continue;
+          c.strokeStyle = v.color; c.lineWidth = 1 * hr; c.setLineDash([4 * hr, 4 * hr]);
+          c.beginPath(); c.moveTo(v.x * hr, 0); c.lineTo(v.x * hr, bitmapSize.height); c.stroke(); c.setLineDash([]);
+          if (v.label) {
+            c.font = `${10 * vr}px -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif`;
+            c.fillStyle = v.color; c.textBaseline = "top"; c.fillText(v.label, v.x * hr + 4 * hr, 6 * vr);
+          }
+        }
+        c.restore();
+      });
+    }
+  }
+  const fillLayer = new StructLayer("bottom"), lineLayer = new StructLayer("normal");
+
+  // 高周期结构的唯一来源：图表和面板都从这里取，保证两边数字一致。
+  // rgN 用 30/90，和 strategy.js 里 regimeN、quant/ 第 3 层实验的口径一致
+  const STRUCT = {
+    d1: { label: "日线", sec: 86400, chN: 120, rgN: 30 },
+    h4: { label: "4h", sec: 4 * 3600, chN: 360, rgN: 90 },
+  };
+  const structCache = new Map();
+  function structureFor(sym, key) {
+    const d = state.data[sym], cfg = STRUCT[key];
+    if (!d || !cfg) return null;
+    const nowS = Date.now() / 1000;
+    const src = (d[key] ?? []).filter((x) => x.time + cfg.sec <= nowS); // 只用已收盘的
+    if (src.length < 10) return null;
+    const ck = `${sym}|${key}|${src.length}|${src[src.length - 1].time}`;
+    if (structCache.has(ck)) return structCache.get(ck);
+    const ch = Levels.channel(src, cfg.chN);
+    const rg = Levels.regime(src, cfg.rgN, 0.35);
+    const fits = Levels.channelFits(src, cfg.chN, cfg.sec);
+    const rfits = Levels.regimeFits(src, cfg.rgN, cfg.sec, 0.35);
+    // 可靠性的两个口径：事后（当前通道窗口内收盘落在带内）vs 当时（第 i 根时的通道，下一根落在带内）
+    let inIn = 0;
+    if (ch) src.slice(-ch.n).forEach((x, i) => { const p = ch.points[i]; if (x.close >= p.dn && x.close <= p.up) inIn++; });
+    let o1 = 0, t1 = 0;
+    for (const f of fits) {
+      const nx = src[f.i + 1];
+      if (!nx) continue;
+      const v = Levels.evalFit(f, nx.time);
+      t1++; if (nx.close >= v.dn && nx.close <= v.up) o1++;
+    }
+    // 当前形态已经持续了多少根（按当时的判定往回数）
+    let streak = 0;
+    const lr = rfits[rfits.length - 1];
+    if (lr) for (let j = rfits.length - 1; j >= 0 && rfits[j].trending === lr.trending && (!lr.trending || rfits[j].up === lr.up); j--) streak++;
+    const out = { ...cfg, key, src, ch, rg, fits, rfits, inSample: ch ? inIn / ch.n : NaN, oos1: t1 ? o1 / t1 : NaN, oosN: t1, streak };
+    if (structCache.size > 60) structCache.clear();
+    structCache.set(ck, out);
+    return out;
+  }
   let chart, candle, vol, ema9S, ema21S, stUpS, stDnS, priceLines = [];
-  // 高周期回归通道（中轴 + 上下沿）
-  let chMidS, chUpS, chDnS;
+  // 回归通道：当前通道（中轴 + 上下轨）+ 当时实际的通道轨迹（上下轨）+ 底部形态色带
+  let chMidS, chUpS, chDnS, trUpS, trDnS, regimeS, futS;
   function initChart() {
     chart = LightweightCharts.createChart($("chart"), {
       layout: { background: { color: "#0e1117" }, textColor: "#9aa3b5" },
@@ -492,6 +609,8 @@
       autoSize: true,
     });
     candle = chart.addCandlestickSeries({ upColor: "#26a69a", downColor: "#ef5350", borderVisible: false, wickUpColor: "#26a69a", wickDownColor: "#ef5350" });
+    candle.attachPrimitive(fillLayer);  // 填充画在K线下面
+    candle.attachPrimitive(lineLayer);  // 框线、价位线段画在上面
     // 鼠标悬停 / 手指点按某根K线时显示它的高低点和涨跌幅
     chart.subscribeCrosshairMove((param) => {
       const d = state.data[state.active];
@@ -501,48 +620,43 @@
       renderOhlc();
     });
     vol = chart.addHistogramSeries({ priceScaleId: "vol", priceFormat: { type: "volume" }, lastValueVisible: false, priceLineVisible: false });
-    chart.priceScale("vol").applyOptions({ scaleMargins: { top: 0.85, bottom: 0 } });
+    chart.priceScale("vol").applyOptions({ scaleMargins: { top: 0.84, bottom: 0.025 } });
+    // 底部形态色带：每根K线当时（只用当时已收盘的数据）判定的趋势/震荡。无未来函数
+    regimeS = chart.addHistogramSeries({ priceScaleId: "regime", lastValueVisible: false, priceLineVisible: false, base: 0 });
+    chart.priceScale("regime").applyOptions({ scaleMargins: { top: 0.982, bottom: 0 }, visible: false });
     candle.priceScale().applyOptions({ scaleMargins: { top: 0.05, bottom: 0.18 } });
     const lineOpt = { lineWidth: 1, lastValueVisible: false, priceLineVisible: false, crosshairMarkerVisible: false };
     ema9S = chart.addLineSeries({ ...lineOpt, color: "#f5c542" });
     ema21S = chart.addLineSeries({ ...lineOpt, color: "#4c8dff" });
     stUpS = chart.addLineSeries({ ...lineOpt, color: "#26a69a", lineWidth: 2, lineStyle: 2 });
     stDnS = chart.addLineSeries({ ...lineOpt, color: "#ef5350", lineWidth: 2, lineStyle: 2 });
-    // 回归通道：淡青色。中轴虚线、上下沿点线，刻意做得比 EMA/Supertrend 弱，
-    // 避免把这个"仅供参考、未经回测"的东西画得比真正驱动信号的指标还显眼。
-    //
-    // autoscaleInfoProvider 返回 null = 通道不参与价格轴自动缩放。
-    //
-    // 这一条是必须的，而且三种配比都试过了：
-    //   1) 参与缩放 + 只画拟合窗口内 → 日线通道半宽 ±11%、跨度六万美元，
-    //      15m 图上价格轴被拉到 74000~98000，K线压成一条线
-    //   2) 不参与 + 只画窗口内 → 价格轴正常，但通道几乎永远在屏幕外，等于没有
-    //   3) 不参与 + 画满整图并外推（现在这个）→ 价格轴由K线决定、K线填满图表，
-    //      通道三条线贯穿整图，超出价格范围的那段自然裁掉。
-    // 通道在价格轴范围之外的部分看不到，但那部分对当下没有参考价值；
-    // 精确数值（斜率/r²/现价在通道中的百分比位置/上下沿价格）面板里一直有。
+    // 通道不参与价格轴自动缩放（autoscaleInfoProvider 返回 null）。日线通道半宽 ±11%，
+    // 参与缩放会把 15m 图的价格轴拉到 74000~98000、K 线压成一条线。价格轴只由 K 线决定，
+    // 通道超出范围的部分自然裁掉。
     const chOpt = { ...lineOpt, autoscaleInfoProvider: () => null };
-    // 中轴实虚线更亮更粗，上下轨稍暗一档但同色系，保证一眼能认出是一组
-    chMidS = chart.addLineSeries({ ...chOpt, color: "rgba(0,217,255,.95)", lineWidth: 2, lineStyle: 2 });
-    chUpS = chart.addLineSeries({ ...chOpt, color: "rgba(0,217,255,.7)", lineWidth: 2, lineStyle: 1 });
-    chDnS = chart.addLineSeries({ ...chOpt, color: "rgba(0,217,255,.7)", lineWidth: 2, lineStyle: 1 });
+    chMidS = chart.addLineSeries({ ...chOpt, color: "rgba(0,217,255,.85)", lineWidth: 1, lineStyle: 2 });
+    chUpS = chart.addLineSeries({ ...chOpt, color: "rgba(0,217,255,.95)", lineWidth: 2, lineStyle: 0 });
+    chDnS = chart.addLineSeries({ ...chOpt, color: "rgba(0,217,255,.95)", lineWidth: 2, lineStyle: 0 });
+    // 当时实际的通道（逐根滚动拟合的右端点）：这才是历史上每个时刻你真正能看到的位置
+    trUpS = chart.addLineSeries({ ...chOpt, color: "rgba(150,170,190,.55)", lineWidth: 1, lineStyle: 1 });
+    trDnS = chart.addLineSeries({ ...chOpt, color: "rgba(150,170,190,.55)", lineWidth: 1, lineStyle: 1 });
+    // 只用来把时间轴往右撑出 FWD 根空白（通道外推、区间框延伸都画在这里）
+    futS = chart.addLineSeries({ ...chOpt, visible: false });
   }
 
-  // 15m 图上"趋势通道"面板用的周期档位
-  const CH_TF = {
-    "1d": { label: "日线", n: 120, key: "d1", sec: 86400 },   // 约 4 个月
-    "4h": { label: "4h", n: 360, key: "h4", sec: 4 * 3600 },  // 约 2 个月
-  };
+  // 15m 主图时「趋势通道」面板可以独立选的周期
+  const CH_TF = { "1d": { label: "日线", key: "d1" }, "4h": { label: "4h", key: "h4" } };
+  const FWD = 8; // 通道外推 / 区间框向右延伸的根数（按主图周期）
 
   function syncChartTfBtns() {
     document.querySelectorAll("[data-ctf]").forEach((b) => b.classList.toggle("on", b.dataset.ctf === state.chartTf));
   }
 
-  // 主图可切换的周期。chN = 该周期上通道拟合根数，rgN = 震荡判定回看根数
+  // 主图可切换的周期（通道/区间的参数统一在 STRUCT 里）
   const CHART_TF = {
-    "15m": { label: "15m", key: "ltf", sec: LTF_SEC, bars: 160, chN: 0, rgN: 0 },
-    "4h": { label: "4h", key: "h4", sec: 4 * 3600, bars: 400, chN: 360, rgN: 120 },
-    "1d": { label: "日线", key: "d1", sec: 86400, bars: 150, chN: 120, rgN: 45 },
+    "15m": { label: "15m", key: "ltf", sec: LTF_SEC, bars: 160 },
+    "4h": { label: "4h", key: "h4", sec: 4 * 3600, bars: 400 },
+    "1d": { label: "日线", key: "d1", sec: 86400, bars: 150 },
   };
 
   // 大周期方向：取当前（含未收盘）K线的 Supertrend
@@ -576,7 +690,8 @@
   let chartSym = null, chartKey = "";
   const chartKeyOf = (d) => {
     const last = d.res.signals[d.res.signals.length - 1];
-    return `${state.active}|${d.ltf.length}|${d.res.signals.length}|${last?.result}|${last?.trailSl}|${d.lastStatus?.code}`;
+    const hk = d[(CHART_TF[state.chartTf] ?? CHART_TF["15m"]).key] ?? [];
+    return `${state.active}|${state.chartTf}|${d.ltf.length}|${hk[hk.length - 1]?.time}|${d.res.signals.length}|${last?.result}|${last?.trailSl}|${d.lastStatus?.code}`;
   };
 
   // K线信息条：开高低收、涨跌幅（相对上一根收盘）、振幅（最高最低差 / 上一根收盘）
@@ -609,7 +724,9 @@
     const ctf = CHART_TF[state.chartTf] ?? CHART_TF["15m"];
     const isLtf = ctf.key === "ltf";
     const narrowUi = matchMedia("(max-width: 900px)").matches; // 窄屏缩短价格线标签
-    const k = (d[ctf.key] ?? []).filter((x) => x.time + ctf.sec <= Date.now() / 1000 || isLtf);
+    // 显示包含正在形成的那根（原来高周期图把它滤掉了，日线图上看不到今天）。
+    // 通道/区间/形态只用已收盘K线算，见 structureFor
+    const k = d[ctf.key] ?? [];
     if (!k.length) return;
     // 15m 用策略已算好的指标；高周期现算（同样的 TA 函数、同样的参数）
     const ind = isLtf ? d.res.ind : (() => {
@@ -661,6 +778,19 @@
     priceLines = [];
     const add = (price, color, title, style = 2, width = 1) =>
       priceLines.push(candle.createPriceLine({ price, color, title, lineWidth: width, lineStyle: style, axisLabelVisible: true }));
+    // 只在价格轴上挂标签，线本身由 lineLayer 从"它开始存在的那根K线"画起
+    const axisTag = (price, color, title) =>
+      priceLines.push(candle.createPriceLine({ price, color, title, lineVisible: false, axisLabelVisible: true }));
+    // 把任意时刻对齐到图上存在的K线时间（primitive 只能把图上有的时间换成坐标）
+    const snap = (t) => {
+      if (t <= k[0].time) return k[0].time;
+      let lo = 0, hi = k.length - 1;
+      while (lo < hi) { const m = (lo + hi + 1) >> 1; if (k[m].time <= t) lo = m; else hi = m - 1; }
+      return k[lo].time;
+    };
+    const lastT = k[k.length - 1].time, futEnd = lastT + FWD * ctf.sec;
+    futS.setData(Array.from({ length: FWD }, (_, i) => ({ time: T(lastT + (i + 1) * ctf.sec) })));
+    const segs = [], boxes = [], bands = [], vlines = [];
 
     // 15m 级支撑压力位：只在 15m 图上画。高周期图上这些位太密、也不是那个尺度该看的东西
     const kl = isLtf ? keyLevels(d) : { above: [], below: [] };
@@ -689,48 +819,63 @@
      ...pick(hLv.filter((l) => l.price <= pxNow).sort((a, b) => b.price - a.price), nLv)]
       .forEach((l) => {
         const isRes = l.price > pxNow;
-        // 窄屏上标签越长，价格轴留给数字的宽度就越少，实测会把价格截断成「8…」
         const nm = narrowUi
           ? `${l.hard ? "硬" : ""}${isRes ? "压" : "撑"}`
           : `${l.srcs.join("+")}${isRes ? "压力" : "支撑"}`;
-        add(l.price, l.hard ? "rgba(188,148,255,.98)" : "rgba(188,148,255,.62)", nm, 0, l.hard ? 3 : 2);
+        const color = l.hard ? "rgba(188,148,255,.98)" : "rgba(188,148,255,.62)";
+        axisTag(l.price, color, nm);
+        // 从最早那个摆动点开始画：在那之前这个位还不存在
+        segs.push({ t0: T(snap(l.from)), t1: T(futEnd), price: l.price, color, width: l.hard ? 2.5 : 1.5 });
       });
 
-    // 高周期回归通道。
-    // 关键：通道**拟合在当前主图周期上**。15m 图上看的是日线/4h 通道投影（半宽 ±11%，
-    // 通常远在屏幕外，所以不参与价格轴缩放）；切到 4h / 日线图时，通道就是这个周期
-    // 自己的通道，尺度天然匹配，这时才让它参与缩放、才真正看得见。
-    const onLtf = ctf.key === "ltf";
-    const chCfg = onLtf ? (CH_TF[state.chTf] ?? CH_TF["1d"]) : { label: ctf.label, n: ctf.chN, key: ctf.key, sec: ctf.sec };
-    const chSrc = (d[chCfg.key] ?? []).filter((x) => x.time + (chCfg.sec ?? (chCfg.key === "d1" ? 86400 : 4 * 3600)) <= nowSec);
-    const ch = Levels.channel(chSrc, chCfg.n);
-    if (ch) {
-      // 通道是一条直线，画满整张图：拟合窗口左边的部分往前延伸，右边往未来延伸
-      // FWD 根，把 rightOffset 那段留白填上。
-      // 注意这超出拟合窗口的部分是**外推**：直线本身是用窗口内的数据算的，
-      // 延伸出去只是把同一条直线画长，不代表那段也拟合得这么好。
-      const FWD = 8;
-      const lastT = k[k.length - 1].time;
-      const times = k.map((x) => x.time);
+    // ── 趋势通道 / 震荡区间 ──────────────────────────────────────────────
+    // 4h/日线图：用该周期自己的结构；15m 图：用面板里选的日线/4h 结构（通常在屏幕外）
+    const sKey = isLtf ? (CH_TF[state.chTf] ?? CH_TF["1d"]).key : ctf.key;
+    const S0 = structureFor(sym, sKey);
+    const closeOf = (x) => Math.min(x.time + ctf.sec, nowSec); // 这根K线收盘的时刻（未收盘就是现在）
+    if (S0 && S0.ch) {
+      const ch = S0.ch;
+      // 当前通道：只画拟合窗口 + 向右外推 FWD 根。
+      // 不再往拟合窗口左边延伸 —— 那一段是拿后来的数据往回画的直线，没有任何意义
+      const times = k.filter((x) => x.time >= ch.from).map((x) => x.time);
       for (let i = 1; i <= FWD; i++) times.push(lastT + i * ctf.sec);
-      const proj = (f) => times.map((t) => ({ time: T(t), value: f(ch.lineAt(t)) }));
-      chMidS.setData(proj((v) => v.mid));
-      chUpS.setData(proj((v) => v.up));
-      chDnS.setData(proj((v) => v.dn));
+      const at = times.map((t) => ({ t, v: ch.lineAt(t) }));
+      chMidS.setData(at.map(({ t, v }) => ({ time: T(t), value: v.mid })));
+      chUpS.setData(at.map(({ t, v }) => ({ time: T(t), value: v.up })));
+      chDnS.setData(at.map(({ t, v }) => ({ time: T(t), value: v.dn })));
+      bands.push({ fill: ch.slopeUp ? "rgba(0,217,255,.07)" : "rgba(255,110,110,.07)", pts: at.map(({ t, v }) => ({ time: T(t), up: v.up, dn: v.dn })) });
+      // 拟合起点：这条线左边没有数据支撑
+      if (ch.from >= k[0].time) vlines.push({ time: T(snap(ch.from)), color: "rgba(0,217,255,.45)", label: narrowUi ? "" : `通道起点 · ${S0.label}${ch.n}根` });
+      // 当时实际的通道：每根K线收盘时用当时的 n 根拟合，取右端点。这才是历史上真实能看到的位置
+      const tr = k.map((x) => { const f = Levels.asOf(S0.fits, closeOf(x)); return f ? { time: T(x.time), ...Levels.evalFit(f, x.time) } : { time: T(x.time) }; });
+      trUpS.setData(tr.map((p) => (p.up != null ? { time: p.time, value: p.up } : { time: p.time })));
+      trDnS.setData(tr.map((p) => (p.dn != null ? { time: p.time, value: p.dn } : { time: p.time })));
     } else {
-      chMidS.setData([]); chUpS.setData([]); chDnS.setData([]);
+      [chMidS, chUpS, chDnS, trUpS, trDnS].forEach((x) => x.setData([]));
     }
 
-    // 震荡区间：只在判定为震荡时画上下沿（趋势里画区间会误导）。
-    // 15m 图上只画离现价 6 ATR 以内的那条，否则会把价格轴拉开好几倍；
-    // 4h / 日线图上区间本来就在可见范围内，两条都画。
-    const rg = Levels.regime(chSrc, onLtf ? (chCfg.key === "d1" ? 30 : 90) : ctf.rgN);
+    // 底部形态色带：每根K线当时的判定（绿=趋势↑ 红=趋势↓ 橙=震荡），无未来函数
+    regimeS.setData(S0 ? k.map((x) => {
+      const r = Levels.asOf(S0.rfits, closeOf(x));
+      return r ? { time: T(x.time), value: 1, color: r.trending ? (r.up ? "rgba(38,166,154,.85)" : "rgba(239,83,80,.85)") : "rgba(255,170,40,.85)" } : { time: T(x.time) };
+    }) : []);
+
+    // 震荡区间：画成框，只覆盖算出它的那 rgN 根 + 向右延伸，不再横贯整张图
+    const rg = S0?.rg;
     if (rg && !rg.trending) {
-      const near = (p) => !onLtf || Math.abs(p - pxNow) <= 6 * atrNow;
-      const rn = (t) => (narrowUi ? `区间${t}` : `${chCfg.label}震荡${t}沿`);
-      if (near(rg.hi)) add(rg.hi, "rgba(255,170,40,.95)", rn("上"), 3, 2);
-      if (near(rg.lo)) add(rg.lo, "rgba(255,170,40,.95)", rn("下"), 3, 2);
+      const t0 = S0.src[S0.src.length - rg.n].time;
+      // 上下沿价格已经挂在价格轴上，框内只写区间性质，避免标签伸出框外盖住价格轴
+      const span = S0.key === "d1" ? `近${rg.n}日` : `近${rg.n}根${S0.label}`;
+      const label = narrowUi ? `${span}震荡` : `${span}震荡 · 宽${rg.widthPct.toFixed(1)}% · 已${S0.streak}根`;
+      boxes.push({ t0: T(snap(t0)), t1: T(futEnd), hi: rg.hi, lo: rg.lo, fill: "rgba(255,170,40,.06)", stroke: "rgba(255,170,40,.95)", label });
+      const near = (p) => !isLtf || Math.abs(p - pxNow) <= 6 * atrNow;
+      if (near(rg.hi)) axisTag(rg.hi, "rgba(255,170,40,.95)", narrowUi ? "区间上" : "震荡上沿");
+      if (near(rg.lo)) axisTag(rg.lo, "rgba(255,170,40,.95)", narrowUi ? "区间下" : "震荡下沿");
     }
+    // 15m 图上日线/4h 的通道和区间比可见范围大一个量级，框边不在屏幕内，只剩一层底色
+    // 把整张图染掉 —— 15m 上不画填充，靠底部色带和面板数字表达
+    fillLayer.set(isLtf ? { bands: [], boxes: [], segs: [], vlines: [] } : { bands, boxes, segs: [], vlines: [] });
+    lineLayer.set({ bands: [], boxes, segs, vlines });
 
     // 当前信号 / 持仓
     const last = d.res.signals[d.res.signals.length - 1], st = d.lastStatus;
@@ -851,12 +996,12 @@
     setHtml("legend", state.chartTf === "15m"
       ? lg("#f5c542", "EMA9") + lg("#4c8dff", "EMA21") +
         '<span><i style="background:#26a69a"></i>/<i style="background:#ef5350"></i>Supertrend</span>' +
-        lg("rgba(0,217,255,.95)", "回归通道") +
-        '<span class="muted legend-note">▲▼ 信号 · ● 趋势转弱 · 红/绿 压力/支撑 · 紫 高周期位 · 🧱 强价位被拒</span>'
+        lg("rgba(0,217,255,.95)", "通道(现在)") + lg("rgba(150,170,190,.8)", "通道(当时)") +
+        '<span class="muted legend-note">▲▼ 信号 · ● 趋势转弱 · 红/绿 压力/支撑 · 紫 高周期位 · 🧱 强价位被拒 · 底部色带=当时形态</span>'
       : lg("#f5c542", "EMA9") + lg("#4c8dff", "EMA21") +
         '<span><i style="background:#26a69a"></i>/<i style="background:#ef5350"></i>Supertrend</span>' +
-        lg("rgba(0,217,255,.95)", "回归通道") + lg("rgba(255,170,40,.95)", "震荡区间") +
-        `<span class="muted legend-note">紫 高周期位 · 指标均为${(CHART_TF[state.chartTf] ?? CHART_TF["15m"]).label}周期 · 信号标记只画在 15m 图上</span>`);
+        lg("rgba(0,217,255,.95)", "通道(现在)") + lg("rgba(150,170,190,.8)", "通道(当时)") + lg("rgba(255,170,40,.95)", "震荡区间") +
+        `<span class="muted legend-note">紫 高周期位（从形成处开始画）· 底部色带=当时形态 绿趋势↑ 红趋势↓ 橙震荡 · 指标均为${(CHART_TF[state.chartTf] ?? CHART_TF["15m"]).label}周期</span>`);
     $("chartTitle").innerHTML = `${short(sym)} <span class="muted small">${CN_NAMES[sym] ?? ""} · ${MARKET_NAMES[marketOf(sym)]}永续 · ${(CHART_TF[state.chartTf] ?? CHART_TF["15m"]).label}${sess ? " · " + sess.txt : ""}</span>`;
     if (!d?.live) { setHtml("liveScore", `<span class="muted">${d?.error ?? "加载中…"}</span>`); return; }
     const L = d.live, p = d.res.params;
@@ -949,9 +1094,8 @@
     const follow = state.chartTf !== "15m";
     const panelTf = follow ? state.chartTf : state.chTf;
     const cfg = CH_TF[panelTf] ?? CH_TF["1d"];
-    const src = (d[cfg.key] ?? []).filter((x) => x.time + (cfg.key === "d1" ? 86400 : 4 * 3600) <= nowS);
-    const ch = Levels.channel(src, cfg.n);
-    const rg = Levels.regime(src, cfg.key === "d1" ? 30 : 90);
+    const SP = structureFor(state.active, cfg.key); // 和图上画的是同一份数据
+    const ch = SP?.ch, rg = SP?.rg;
     const tfBtn = (k) => `<button class="btn tf-btn${panelTf === k ? " on" : ""}" data-chtf="${k}">${CH_TF[k].label}</button>`;
     let chTxt = follow
       ? `<div class="sub-h">趋势通道 / 震荡区间 <span class="muted small">跟随主图（${cfg.label}）</span></div>`
@@ -972,8 +1116,18 @@
         `<div class="tf-line"><span>${cfg.label}形态</span>` +
         `<span><b class="${rg.trending ? (rg.up ? "long" : "short") : "wait"}">${rg.trending ? (rg.up ? "趋势↑" : "趋势↓") : "震荡"}</b></span>` +
         `<span class="muted">效率比 ${rg.er.toFixed(2)}</span>` +
-        `<span class="muted">${rg.trending ? "" : `区间 ${fmtPrice(rg.lo)}~${fmtPrice(rg.hi)}（宽 ${rg.widthPct.toFixed(1)}%）`}</span></div>` +
-        `<div class="muted small" style="margin-top:4px">通道是对 log 收盘价做最小二乘回归（${cfg.label} ${ch.n} 根），不是手连的趋势线：给定周期和窗口，结果唯一、可复现、能回测。r² 低说明"趋势"这个描述本身就不贴合当前走势，这时候通道只当波动范围看。<b>效率比</b>=净位移/路径总长，越接近 1 越单边。<b>这些阈值都没经过回测验证，不参与信号判定。</b>${follow ? "" : "<br>当前主图是 15m，通道半宽 ±" + ch.bandPct.toFixed(0) + "% 远超 15m 的可见区间，所以图上基本看不到线 —— 点图表左上角的「4h」或「日线」就能看到整条通道。"}</div>`;
+        `<span class="muted">${rg.trending ? `近${rg.n}根 · 已持续${SP.streak}根` : `近${rg.n}根 ${fmtPrice(rg.lo)}~${fmtPrice(rg.hi)}（宽 ${rg.widthPct.toFixed(1)}%）· 已${SP.streak}根`}</span></div>` +
+        // 可靠性：事后看（线是用这些点拟合的，必然高）vs 当时实际（只用当时数据，下一根还在带内的比例）
+        `<div class="tf-line"><span>可靠性</span>` +
+        `<span>当时 <b class="${SP.oos1 >= 0.85 ? "long" : SP.oos1 >= 0.75 ? "wait" : "short"}">${(SP.oos1 * 100).toFixed(0)}%</b></span>` +
+        `<span class="muted">事后看 ${(SP.inSample * 100).toFixed(0)}%</span>` +
+        `<span class="muted small">下一根收盘落在通道内（${SP.oosN} 次）</span></div>` +
+        `<div class="muted small" style="margin-top:4px">通道是对 log 收盘价做最小二乘回归（${cfg.label} ${ch.n} 根），不是手连的趋势线：结果唯一、可复现。` +
+        `<b>图上亮青色的是"现在"的通道</b>，它是用这 ${ch.n} 根拟合出来的，所以历史K线看起来"刚好在轨道里反弹"——那是事后画线，当时并不存在。` +
+        `<b>灰色点线是"当时"的通道</b>（每根K线收盘时只用当时数据拟合），历史上真实能看到的是它。` +
+        `「可靠性」两个数的差距就是事后画线的错觉有多大。底部色带是每根K线当时的形态判定（绿=趋势↑ 红=趋势↓ 橙=震荡）。` +
+        `<b>效率比</b>=净位移/路径总长，越接近 1 越单边。<b>这些阈值都没经过回测验证，不参与信号判定。</b>` +
+        `${follow ? "" : "<br>当前主图是 15m，通道半宽 ±" + ch.bandPct.toFixed(0) + "% 远超 15m 的可见区间 —— 点图表左上角的「4h」或「日线」看完整通道。"}</div>`;
     } else {
       chTxt += '<span class="muted small">数据不足</span>';
     }
@@ -1285,8 +1439,10 @@
       if (!d?.res) return;
       if (chartKeyOf(d) !== chartKey) renderChart();
       else {
-        // 只更新最后一根，避免整图重绘
-        const x = d.ltf[d.ltf.length - 1], T = x.time + TZ;
+        // 只更新最后一根，避免整图重绘。必须按当前主图周期取 —— 原来固定用 15m，
+        // 切到日线图后每秒都会把一根 15m 时间戳的K线塞进日线图里
+        const arr = d[(CHART_TF[state.chartTf] ?? CHART_TF["15m"]).key] ?? d.ltf;
+        const x = arr[arr.length - 1], T = x.time + TZ;
         candle.update({ time: T, open: x.open, high: x.high, low: x.low, close: x.close });
         renderOhlc();
         vol.update({ time: T, value: x.volume, color: x.close >= x.open ? "rgba(38,166,154,.35)" : "rgba(239,83,80,.35)" });
