@@ -153,6 +153,35 @@ for (const sym of SYMS) {
   }
 }
 
+
+// ── 无未来函数：逐根滚动版本（图上"当时的通道"、底部形态色带用的就是它们）──
+{
+  const d1 = load('BTCUSDT', '1d', MONTHS), h4 = load('BTCUSDT', '4h', MONTHS);
+  for (const [k, n, sec, nm] of [[d1, 60, 86400, '日线'], [h4, 180, 14400, '4h']]) {
+    const full = L.channelFits(k, n, sec), part = L.channelFits(k.slice(0, k.length - 40), n, sec);
+    ok(full.length > 0 && part.length === full.length - 40, `${nm} channelFits 数量不对`);
+    // 截掉最后 40 根，前面的结果必须一模一样：说明第 i 个结果没用到 i 之后的数据
+    ok(part.every((f, i) => f.a === full[i].a && f.b === full[i].b && f.sigma === full[i].sigma), `${nm} channelFits 截断后历史结果变了（未来函数）`);
+    // 第 i 个结果 = 当时（只给到第 i 根）调用 channel() 得到的
+    for (const j of [0, Math.floor(full.length / 2), full.length - 1]) {
+      const f = full[j], c = L.channel(k.slice(0, f.i + 1), n), t = k[f.i].time;
+      ok(Math.abs(L.evalFit(f, t).up / c.lineAt(t).up - 1) < 1e-12, `${nm} channelFits[${j}] ≠ 当时的 channel()`);
+      ok(f.validFrom === k[f.i].time + sec, `${nm} validFrom 不是该根收盘时刻`);
+    }
+    const rf = L.regimeFits(k, 30, sec), rp = L.regimeFits(k.slice(0, k.length - 40), 30, sec);
+    ok(rp.every((r, i) => r.er === rf[i].er && r.trending === rf[i].trending && r.hi === rf[i].hi), `${nm} regimeFits 截断后历史结果变了`);
+    // asOf 不能在 validFrom 之前拿到结果
+    const f5 = full[5];
+    ok(L.asOf(full, f5.validFrom - 1) === full[4] && L.asOf(full, f5.validFrom) === f5, `${nm} asOf 边界错`);
+    ok(L.asOf(full, full[0].validFrom - 1) === null, `${nm} asOf 在第一个结果之前应返回 null`);
+  }
+  // 高周期关键位的 from（从哪开始画线）必须落在它自己的K线范围内，且不晚于现在
+  const now = d1[d1.length - 1].time + 86400;
+  const lv = L.htf(h4, d1, now);
+  ok(lv.every((l) => Number.isFinite(l.from) && l.from <= now && l.from >= Math.min(h4[0].time, d1[0].time)), 'htf 的 from 时间非法');
+  console.log(`\n滚动版本因果性：channelFits / regimeFits 截断不变、asOf 边界正确、htf.from 合法`);
+}
+
 // 单边序列 ER 应接近 1，锯齿序列应接近 0
 const mono = Array.from({ length: 30 }, (_, i) => ({ close: 100 + i, high: 100 + i, low: 100 + i }));
 const saw = Array.from({ length: 30 }, (_, i) => ({ close: 100 + (i % 2), high: 101, low: 100 }));
