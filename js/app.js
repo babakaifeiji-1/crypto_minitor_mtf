@@ -55,14 +55,15 @@
     { id: "wave", name: "波浪", color: "#00d9ff", tip: "推动浪/ABC 候选：只保留满足三条铁律、斐波那契比例最贴近的一组" },
     { id: "bos", name: "BOS/CHoCH", color: "#f5c542", tip: "BOS = 顺势突破前高/前低；CHoCH = 逆势突破，结构可能转变" },
     { id: "sig", name: "信号", color: "#c9d1e0", tip: "策略信号、止损/TP1、趋势转弱、🧱 强价位被拒" },
+    { id: "sst", name: "结构信号", color: "#ff9f43", tip: "新的结构策略（1h 出信号、4h 定方向）：顺 4h 结构的 1h BOS/CHoCH。在 1h/15m 图上显示，回测见右侧「价格结构」面板" },
     { id: "ma", name: "均线", color: "#f5c542", tip: "EMA9 / EMA21 / Supertrend" },
     { id: "old", name: "策略价位", color: "rgba(239,83,80,.6)", tip: "旧版画法：策略止损用的 15m/1h ★价位 + 4h/日线紫色位" },
     { id: "reg", name: "回归通道", color: "rgba(0,217,255,.95)", tip: "旧版：log 收盘价回归通道 + 底部形态色带 + Donchian 震荡框" },
   ];
-  const LAYER_DEFAULT = { swing: 0, zone: 1, htf: 1, tl: 1, ch: 0, zs: 1, wave: 0, bos: 0, sig: 1, ma: 0, old: 0, reg: 0 };
+  const LAYER_DEFAULT = { swing: 0, zone: 1, htf: 1, tl: 1, ch: 0, zs: 1, wave: 0, bos: 0, sig: 1, sst: 1, ma: 0, old: 0, reg: 0 };
   const LAYER_PRESETS = {
-    简洁: { zone: 1, htf: 1, tl: 1, sig: 1 },
-    结构: { swing: 1, zone: 1, htf: 1, tl: 1, ch: 1, zs: 1, bos: 1, sig: 1 },
+    简洁: { zone: 1, htf: 1, tl: 1, sig: 1, sst: 1 },
+    结构: { swing: 1, zone: 1, htf: 1, tl: 1, ch: 1, zs: 1, bos: 1, sig: 1, sst: 1 },
     波浪: { swing: 1, wave: 1, zone: 1, sig: 1 },
   };
 
@@ -220,6 +221,7 @@
     d.lastStatus = last ? Strategy.signalStatus(last, d.res, d.ltf, LTF_SEC) : null;
     d.dirty = false;
     checkAlerts(sym);
+    checkSst(sym);
   }
 
   // 本机信号日志：长期累积已平仓信号及其大周期分组，用于判断日线/4h过滤到底有没有用
@@ -705,6 +707,42 @@
     return S;
   }
 
+  // ── 结构策略（structstrat.js）：1h 出信号、4h 定方向，参数 = 回测选定的默认值 ──
+  // 回测（实验十三/十四，10 个币 45 个月，含费用滑点资金费）写在面板里，改参数必须重跑实验
+  const SST_BT = { n: 2580, win: 51, net: 0.025, t: 0.98, oos: 0.058, oosT: 1.44, base: -0.067, diffT: 3.1, years: "2023 +0.02 / 2024 -0.02 / 2025 +0.03 / 2026 +0.10" };
+  const sstCache = new Map();
+  function sstOf(sym) {
+    const d = state.data[sym];
+    if (!d?.htf?.length || !d?.h4?.length) return null;
+    const nowS = Date.now() / 1000;
+    const k = d.htf.filter((x) => x.time + 3600 <= nowS), hk = d.h4.filter((x) => x.time + 14400 <= nowS);
+    if (k.length < 100 || hk.length < 60) return null;
+    const ck = `${sym}|${k.length}|${k[k.length - 1].time}|${hk[hk.length - 1].time}`;
+    if (sstCache.get(sym)?.ck === ck) return sstCache.get(sym).v;
+    const trades = StructStrat.run(k, hk, 3600, 14400);
+    const bias = StructStrat.htfBiasFn(hk, 14400)(nowS); // 和策略内部判定用同一个函数
+    const v = { trades, last: trades[trades.length - 1] ?? null, open: trades.find((t) => t.open) ?? null, k, bias };
+    sstCache.set(sym, { ck, v });
+    return v;
+  }
+  function checkSst(sym) {
+    const d = state.data[sym], v = sstOf(sym);
+    if (!d || !v) return;
+    const seen = (d.sstSeen ??= new Set(v.trades.map((t) => t.time))); // 首次：历史的不提醒
+    for (const t of v.trades) {
+      if (seen.has(t.time)) continue;
+      seen.add(t.time);
+      if (Date.now() / 1000 - (t.time + 3600) > 2 * 3600) continue;
+      const side = t.side > 0 ? "做多" : "做空";
+      notify({
+        kind: t.side > 0 ? "long" : "short", event: "sst", sym,
+        title: `🔶 ${nameOf(sym)} 结构信号 ${side}（1h）`,
+        body: `4h 结构${t.side > 0 ? "向上" : "向下"}，1h 出现${t.kind}${t.side > 0 ? "↑" : "↓"}<br>入场 <b>${fmtPrice(t.entry)}</b> · 止损 ${fmtPrice(t.sl)}（${fmtPct(t.sl, t.entry)}）· 1R ${fmtPrice(t.entry + t.side * t.risk)} 平一半后止损移保本，剩余跟踪 1h 摆动点<br><span class="muted">实验性：回测每笔 +0.025R，未达显著，仅供参考</span>`,
+        feed: `<b class="${t.side > 0 ? "long" : "short"}">🔶结构${side}</b> 1h ${t.kind} @ ${fmtPrice(t.entry)}`,
+      });
+    }
+  }
+
   // 图层图元生成。k = 图上的K线（含正在形成的），sec = 图的周期
   // 配色：本周期 红压/绿撑；大周期 紫（近一级）/粉（远一级）；中枢 橙；通道 蓝；波浪 青。
   const rgba = (rgb, a) => `rgba(${rgb},${a})`;
@@ -1080,6 +1118,20 @@
       time: T(ev.time), position: ev.isRes ? "aboveBar" : "belowBar", color: "#f5a623",
       shape: "square", size: ev.first ? 1 : 0.6, text: ev.first ? "🧱" : "",
     });
+    // 结构信号（1h）：在 1h / 15m / 3m 图上标出。时间对齐到图上包含"1h 收盘时刻"的那根
+    const sstOn = Ly.sst && ["1h", "15m", "3m"].includes(state.chartTf);
+    const SV = sstOn ? sstOf(sym) : null;
+    if (SV) {
+      const snapT = (t) => { let lo = 0, hi = k.length - 1; if (t <= k[0].time) return null; while (lo < hi) { const m = (lo + hi + 1) >> 1; if (k[m].time <= t) lo = m; else hi = m - 1; } return k[lo].time; };
+      for (const t of SV.trades) {
+        const at = snapT(state.chartTf === "1h" ? t.time : t.time + 3600 - ctf.sec);
+        if (at != null) markers.push({ time: T(at), position: t.side > 0 ? "belowBar" : "aboveBar", color: "#ff9f43", shape: t.side > 0 ? "arrowUp" : "arrowDown", text: `结构${t.side > 0 ? "多" : "空"}` });
+        if (!t.open) {
+          const ex = snapT(state.chartTf === "1h" ? SV.k[t.exitI].time : SV.k[t.exitI].time + 3600 - ctf.sec);
+          if (ex != null) markers.push({ time: T(ex), position: t.side > 0 ? "aboveBar" : "belowBar", color: t.r > 0 ? "rgba(38,166,154,.9)" : "rgba(239,83,80,.9)", shape: "circle", size: 0.6, text: `${t.r >= 0 ? "+" : ""}${t.r.toFixed(1)}R` });
+        }
+      }
+    }
     markers.sort((a, b) => a.time - b.time);
     candle.setMarkers(markers);
 
@@ -1181,6 +1233,13 @@
     fillLayer.set(items);
     lineLayer.set(items);
 
+    // 结构信号持仓中：入场 / 止损（含跟踪后的）/ 1R
+    if (SV?.open) {
+      const o = SV.open;
+      add(o.entry, "#ff9f43", "结构入场", 0, 1);
+      add(o.stop, "#ff9f43", o.half ? "结构跟踪止损" : "结构止损", 2, 2);
+      if (!o.half) add(o.tp, "rgba(255,159,67,.8)", "结构1R平半", 2, 1);
+    }
     // 当前信号 / 持仓
     const last = d.res.signals[d.res.signals.length - 1], st = d.lastStatus;
     if (!Ly.sig) { /* 信号图层关闭 */ }
@@ -1604,6 +1663,24 @@
       }
       html += `<div class="sub-h">${TFS[main].label} 细节 <span class="muted small">ATR ${fmtPrice(S.atrNow)} · 每笔约 ${S.avgLegBars.toFixed(0)} 根</span></div>` +
         `<div class="st-detail">${rows.map(([a, b]) => `<div class="row"><span class="muted">${a}</span><span>${b}</span></div>`).join("")}</div>`;
+    }
+    // 结构策略（1h→4h）
+    const SV = sstOf(sym);
+    if (SV) {
+      const o = SV.open, l = SV.last, px = d.ltf[d.ltf.length - 1].close;
+      const side = (t) => `<b class="${t.side > 0 ? "long" : "short"}">${t.side > 0 ? "做多" : "做空"}</b>`;
+      let cur;
+      if (o) {
+        const rNow = ((px - o.entry) * o.side) / o.risk;
+        cur = `持仓中 ${side(o)} · ${fmtTime(o.time)} ${o.kind} · 入场 <b class="num">${fmtPrice(o.entry)}</b> · ${o.half ? "已平一半，跟踪止损" : "止损"} <b class="num">${fmtPrice(o.stop)}</b>` +
+          `${o.half ? "" : ` · 1R <span class="num">${fmtPrice(o.tp)}</span>`} · 浮动 <b class="${rNow >= 0 ? "long" : "short"}">${rNow >= 0 ? "+" : ""}${rNow.toFixed(2)}R</b>`;
+      } else if (l) cur = `空仓 · 上一笔 ${side(l)} ${fmtTime(l.time)} → <b class="${l.r > 0 ? "long" : "short"}">${l.r >= 0 ? "+" : ""}${l.r.toFixed(2)}R</b>（未扣费）`;
+      else cur = '<span class="muted">近 20 天没有信号</span>';
+      const b = SV.bias;
+      html += `<div class="sub-h">🔶 结构策略 <span class="muted small">1h 出信号 · 4h 定方向 · 实验性</span></div>
+        <div class="st-detail"><div class="row"><span class="muted">现在</span><span>${cur}</span></div>
+        <div class="row"><span class="muted">规则</span><span class="small">4h ${b > 0 ? '<span class="long">向上</span>' : b < 0 ? '<span class="short">向下</span>' : "不明（不做）"}时，等 1h 顺向 BOS/CHoCH 收盘入场；止损在回调极值外 0.1ATR；1R 平一半移保本，剩余跟踪 1h 摆动点；最长 8 天</span></div>
+        <div class="row"><span class="muted">回测</span><span class="small">10 币 45 个月 ${SST_BT.n} 笔，胜率 ${SST_BT.win}%，扣费后每笔 <b class="long">+${SST_BT.net}R</b>（t=${SST_BT.t}，<b>不显著</b>）；样本外 2025-26 +${SST_BT.oos}R（t=${SST_BT.oosT}）。同周期原策略 ${SST_BT.base}R，新策略好 0.09R（t=${SST_BT.diffT}，显著）。分年 ${SST_BT.years}</span></div></div>`;
     }
     html += `<div class="muted small" style="margin-top:6px">摆动点 = ATR ZigZag（反向走出约 2.2×ATR 才确认），所有图层都从同一套摆动点算出；
       结构 = 最近两个高点/低点排列（HH+HL 上升、LH+LL 下降），在中枢里时判震荡。波浪只是"最符合铁律的一种数法"，不是预测。

@@ -8,7 +8,7 @@ const Push = (() => {
     chatId: "",
     enabled: false, // 本机负责推送：只在家里那台常开的电脑上打开，避免手机和电脑重复推送
     pageUrl: "", // 消息里附带的看板链接（部署后填写）
-    events: { signal: true, weak: true, tp1: true, close: true, exit: false, level: false, health: true },
+    events: { signal: true, weak: true, tp1: true, close: true, exit: false, level: false, sst: false, health: true },
   };
   let cfg = load();
   const queue = [];
