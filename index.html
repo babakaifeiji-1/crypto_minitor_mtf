@@ -12,11 +12,11 @@
   <link rel="icon" href="icon.svg" type="image/svg+xml" />
   <link rel="apple-touch-icon" href="icon.svg" />
   <title>盯盘助手 MTF · 多周期</title>
-  <link rel="stylesheet" href="css/style.css?v=7" />
+  <link rel="stylesheet" href="css/style.css?v=8" />
 </head>
 <body>
   <header class="topbar">
-    <div class="brand">盯盘助手 <span class="sub">15m 信号 · 1h 方向过滤</span></div>
+    <div class="brand">盯盘助手 <span class="sub">短线 15m+3m · 长线 1h/4h/日线</span></div>
     <button id="menuBtn" class="btn menu-btn">⚙️ 设置</button>
     <div class="controls">
       <label title="共振分数达到该值才发出信号。越高信号越少，胜率越高">
@@ -44,14 +44,22 @@
       <div class="chart-head">
         <div id="chartTitle" class="chart-title"></div>
         <div class="chart-tf" id="chartTf">
-          <button class="btn tf-btn" data-ctf="15m">15m</button>
+          <span class="tf-grp">短线</span>
+          <button class="btn tf-btn" data-ctf="15m" title="15 分钟主图 + 下方 3 分钟入场确认">15m+3m</button>
+          <span class="tf-grp">长线</span>
+          <button class="btn tf-btn" data-ctf="1h">1h</button>
           <button class="btn tf-btn" data-ctf="4h">4h</button>
           <button class="btn tf-btn" data-ctf="1d">日线</button>
         </div>
-        <div class="legend" id="legend"></div>
       </div>
+      <div id="layerBar" class="layer-bar"></div>
       <div id="ohlc" class="ohlc num"></div>
       <div id="chart" class="chart"></div>
+      <div id="subWrap" class="sub-wrap">
+        <div id="subHead" class="sub-head"></div>
+        <div id="chart3" class="chart"></div>
+      </div>
+      <div id="legend" class="legend"></div>
       <div id="indicatorBar" class="indicator-bar"></div>
     </section>
 
@@ -59,6 +67,10 @@
       <div class="panel">
         <h3>最新信号 · 操作建议</h3>
         <div id="lastSignal"></div>
+      </div>
+      <div class="panel">
+        <h3>价格结构 <span class="muted small">（波段 · 中枢 · 趋势线 · 波浪，只做显示）</span></h3>
+        <div id="structPanel"></div>
       </div>
       <div class="panel" id="flowPanel" style="display:none">
         <h3>合约资金面 <span class="muted small">（仅加密货币）</span></h3>
@@ -69,7 +81,7 @@
         <div id="bigPicture"></div>
       </div>
       <div class="panel">
-        <h3>关键价位 <span class="muted small">（15m / 1h 支撑压力）</span></h3>
+        <h3>策略价位 <span class="muted small">（15m / 1h，信号止损用的那套）</span></h3>
         <div id="keyLevels"></div>
       </div>
       <div class="panel">
@@ -128,10 +140,11 @@
   </div>
 
   <script src="js/vendor/lightweight-charts.js"></script>
-  <script src="js/indicators.js?v=7"></script>
-  <script src="js/levels.js?v=7"></script>
-  <script src="js/strategy.js?v=7"></script>
-  <script src="js/push.js?v=7"></script>
-  <script src="js/app.js?v=7"></script>
+  <script src="js/indicators.js?v=8"></script>
+  <script src="js/levels.js?v=8"></script>
+  <script src="js/structure.js?v=8"></script>
+  <script src="js/strategy.js?v=8"></script>
+  <script src="js/push.js?v=8"></script>
+  <script src="js/app.js?v=8"></script>
 </body>
 </html>

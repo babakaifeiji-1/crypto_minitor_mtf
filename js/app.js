@@ -44,6 +44,28 @@
     return saved;
   }
 
+  // 图层：每一层独立开关。结构类图层全部来自 Structure.analyze（同一套摆动点）
+  const LAYERS = [
+    { id: "swing", name: "波段", color: "rgba(210,215,230,.8)", tip: "ATR ZigZag 转折点连线，标 HH/HL/LH/LL；最后一段虚线 = 还没确认" },
+    { id: "zone", name: "支撑压力", color: "#ef5350", tip: "本周期摆动点聚类成区，每侧最多 2 个；×N = 触碰次数，⇅ = 支撑压力互换过" },
+    { id: "htf", name: "大周期位", color: "rgba(188,148,255,.95)", tip: "上两级周期的支撑压力区，投影到本图（半透明色带）" },
+    { id: "tl", name: "趋势线", color: "#26a69a", tip: "已确认低点/高点连线；实线 ≥3 次触碰，虚线 = 2 次（候选），灰色 = 最近被收盘击穿" },
+    { id: "ch", name: "通道", color: "#4c8dff", tip: "趋势线 + 过对侧极值的平行线；对侧也要 ≥2 次触碰才画。两条线收敛时标三角形" },
+    { id: "zs", name: "中枢", color: "rgba(255,170,40,.95)", tip: "缠论笔中枢：至少 3 笔重叠的区间 [ZD, ZG]，就是震荡区间" },
+    { id: "wave", name: "波浪", color: "#00d9ff", tip: "推动浪/ABC 候选：只保留满足三条铁律、斐波那契比例最贴近的一组" },
+    { id: "bos", name: "BOS/CHoCH", color: "#f5c542", tip: "BOS = 顺势突破前高/前低；CHoCH = 逆势突破，结构可能转变" },
+    { id: "sig", name: "信号", color: "#c9d1e0", tip: "策略信号、止损/TP1、趋势转弱、🧱 强价位被拒" },
+    { id: "ma", name: "均线", color: "#f5c542", tip: "EMA9 / EMA21 / Supertrend" },
+    { id: "old", name: "策略价位", color: "rgba(239,83,80,.6)", tip: "旧版画法：策略止损用的 15m/1h ★价位 + 4h/日线紫色位" },
+    { id: "reg", name: "回归通道", color: "rgba(0,217,255,.95)", tip: "旧版：log 收盘价回归通道 + 底部形态色带 + Donchian 震荡框" },
+  ];
+  const LAYER_DEFAULT = { swing: 1, zone: 1, htf: 1, tl: 1, ch: 1, zs: 1, wave: 0, bos: 0, sig: 1, ma: 0, old: 0, reg: 0 };
+  const LAYER_PRESETS = {
+    简洁: { zone: 1, htf: 1, tl: 1, sig: 1 },
+    结构: { swing: 1, zone: 1, htf: 1, tl: 1, ch: 1, zs: 1, bos: 1, sig: 1 },
+    波浪: { swing: 1, wave: 1, zone: 1, sig: 1 },
+  };
+
   const sizing = store.load("sizing", { risk: 10 }); // 每笔愿意亏多少 USDT
   const state = {
     symbols: initialSymbols(),
@@ -55,7 +77,8 @@
     feed: [],
     flashUntil: {}, // sym -> 时间戳，卡片闪烁
     chTf: store.load("chTf", "1d"), // 15m 图上「趋势通道」面板的周期档位："1d" 或 "4h"
-    chartTf: store.load("chartTf", "15m"), // 主图周期："15m" / "4h" / "1d"
+    chartTf: store.load("chartTf", "15m"), // 主图周期："15m"（短线，带 3m 副图）/ "1h" / "4h" / "1d"（长线）
+    layers: { ...LAYER_DEFAULT, ...store.load("layers", {}) }, // 图上各图层开关，见 LAYERS
   };
   state.active = state.symbols[0];
 
@@ -145,13 +168,15 @@
   }
 
   async function loadSymbol(sym) {
-    const [ltf, htf, h4, d1] = await Promise.all([
+    const [ltf, htf, h4, d1, m3] = await Promise.all([
       // 4h/日线拉得比原版多：通道拟合窗口拉长到 4h 360 根 / 日线 120 根，还要留出余量
       fetchKlines(sym, LTF, 1500), fetchKlines(sym, HTF, 500), fetchKlines(sym, "4h", 1000), fetchKlines(sym, "1d", 500),
+      // 3m 只用于短线副图（入场确认），不参与策略。失败不影响其它
+      fetchKlines(sym, "3m", 1000).catch(() => []),
     ]);
     const prev = state.data[sym];
     state.data[sym] = {
-      ltf, htf, h4, d1, res: null, live: null, dirty: true, computedAt: 0,
+      ltf, htf, h4, d1, m3, res: null, live: null, dirty: true, computedAt: 0,
       seen: prev?.seen ?? new Map(), exitAlerted: prev?.exitAlerted ?? new Set(), initialized: prev?.initialized ?? false,
     };
     recompute(sym);
@@ -435,7 +460,7 @@
   let ws = null, wsUrlIdx = 0, wsRetry = 0, wsTimer = null, lastMsgAt = 0, downSince = 0;
   function connectWs() {
     if (ws) { ws.onclose = null; ws.close(); }
-    const streams = state.symbols.flatMap((s) => [LTF, HTF, "4h", "1d"].map((iv) => `${s.toLowerCase()}@kline_${iv}`)).join("/");
+    const streams = state.symbols.flatMap((s) => [LTF, HTF, "4h", "1d", "3m"].map((iv) => `${s.toLowerCase()}@kline_${iv}`)).join("/");
     const url = `${WS_URLS[wsUrlIdx]}?streams=${streams}`;
     setConn("wait", "连接中");
     ws = new WebSocket(url);
@@ -456,8 +481,9 @@
       if (!d) return;
       const c = { time: k.t / 1000, open: +k.o, high: +k.h, low: +k.l, close: +k.c, volume: +k.v, takerBuy: +k.V };
       lastMsgAt = Date.now();
-      const arr = { [LTF]: d.ltf, [HTF]: d.htf, "4h": d.h4, "1d": d.d1 }[k.i];
+      const arr = { [LTF]: d.ltf, [HTF]: d.htf, "4h": d.h4, "1d": d.d1, "3m": d.m3 }[k.i];
       if (arr) upsertCandle(arr, c);
+      if (k.i === "3m") return; // 3m 只画副图，不触发策略重算
       d.dirty = true;
       if (k.x) recompute(k.s); // K线收盘立刻计算信号
     };
@@ -479,88 +505,351 @@
   }
 
   // ---------------- 图表 ----------------
-  // 自绘图层（lightweight-charts v4.2 primitive）：通道填充、震荡区间框、从形成点开始的价位线。
-  // 原生 price line 只能横贯整张图，画出来就像"这个位一直存在"——对历史K线来说是假的。
-  class StructLayer {
-    constructor(z) { this._z = z; this._d = { bands: [], boxes: [], segs: [], vlines: [] }; this._views = [this]; }
+  // 自绘图层（lightweight-charts v4.2 primitive）。原生 price line 只能横贯整张图，
+  // 画出来就像"这个位一直存在"——对历史K线来说是假的。所以区、线、框都从它开始存在的那根K线画起。
+  //
+  // 图元（时间已经加过 TZ、并且对齐到图上存在的K线时间）：
+  //   rect  { t0,t1,lo,hi, fill, stroke, dash, frame, label, lc, la:"left"|"right" }
+  //   line  { t0,p0,t1,p1, color, width, dash, label, lc }      趋势线、通道、BOS 线
+  //   poly  { pts:[{time,price}], color, width, dashLast }        波段、波浪
+  //   band  { pts:[{time,up,dn}], fill }                          通道填充
+  //   text  { time, price, text, color, pos:"above"|"below", circle, size }
+  //   vline { time, color, label }
+  // 两个实例：bottom 只画填充（在K线下面），top 画线和文字。
+  class Overlay {
+    constructor(z) { this._z = z; this._items = []; this._views = [this]; }
     attached(p) { this._chart = p.chart; this._series = p.series; this._req = p.requestUpdate; }
     detached() { this._chart = this._series = null; }
-    set(d) { this._d = d; this._req?.(); }
-    // ---- view ----
+    set(items) { this._items = items; this._req?.(); }
     updateAllViews() {
       const ts = this._chart?.timeScale(), s = this._series;
       if (!ts || !s) { this._g = null; return; }
-      const X = (t) => ts.timeToCoordinate(t), Y = (p) => s.priceToCoordinate(p), d = this._d;
-      this._g = {
-        bands: d.bands.map((b) => ({ fill: b.fill, pts: b.pts.map((p) => ({ x: X(p.time), u: Y(p.up), l: Y(p.dn) })).filter((p) => p.x != null && p.u != null && p.l != null) })),
-        boxes: d.boxes.map((b) => ({ ...b, x0: X(b.t0), x1: X(b.t1), y0: Y(b.hi), y1: Y(b.lo) })),
-        segs: d.segs.map((g) => ({ ...g, x0: X(g.t0), x1: X(g.t1), y: Y(g.price) })),
-        vlines: d.vlines.map((v) => ({ ...v, x: X(v.time) })),
-      };
+      const X = (t) => ts.timeToCoordinate(t), Y = (p) => s.priceToCoordinate(p);
+      this._g = this._items.map((it) => {
+        switch (it.t) {
+          case "rect": return { ...it, x0: X(it.t0), x1: X(it.t1), y0: Y(it.hi), y1: Y(it.lo) };
+          case "line": return { ...it, x0: X(it.t0), x1: X(it.t1), y0: Y(it.p0), y1: Y(it.p1) };
+          case "poly": return { ...it, xy: it.pts.map((p) => [X(p.time), Y(p.price)]) };
+          case "band": return { ...it, xy: it.pts.map((p) => [X(p.time), Y(p.up), Y(p.dn)]) };
+          case "text": return { ...it, x: X(it.time), y: Y(it.price) };
+          case "vline": return { ...it, x: X(it.time) };
+          default: return null;
+        }
+      }).filter(Boolean);
     }
     paneViews() { return this._views; }
     zOrder() { return this._z; }
     renderer() { return this; }
-    // ---- renderer ----
     draw(target) {
       const g = this._g;
       if (!g) return;
+      const ok = (...v) => v.every((x) => x != null && isFinite(x));
       target.useBitmapCoordinateSpace(({ context: c, horizontalPixelRatio: hr, verticalPixelRatio: vr, bitmapSize }) => {
-        const bottom = this._z === "bottom";
-        if (bottom) {
-          for (const b of g.bands) {
-            if (b.pts.length < 2) continue;
-            c.beginPath();
-            b.pts.forEach((p, i) => (i ? c.lineTo(p.x * hr, p.u * vr) : c.moveTo(p.x * hr, p.u * vr)));
-            for (let i = b.pts.length - 1; i >= 0; i--) c.lineTo(b.pts[i].x * hr, b.pts[i].l * vr);
-            c.closePath(); c.fillStyle = b.fill; c.fill();
+        c.save();
+        if (this._z === "bottom") {
+          for (const it of g) {
+            if (it.t === "rect" && it.fill && ok(it.x0, it.x1, it.y0, it.y1)) {
+              c.fillStyle = it.fill;
+              c.fillRect(it.x0 * hr, it.y0 * vr, (it.x1 - it.x0) * hr, Math.max(1, (it.y1 - it.y0) * vr));
+            } else if (it.t === "band") {
+              const p = it.xy.filter((q) => ok(...q));
+              if (p.length < 2) continue;
+              c.beginPath();
+              p.forEach((q, i) => (i ? c.lineTo(q[0] * hr, q[1] * vr) : c.moveTo(q[0] * hr, q[1] * vr)));
+              for (let i = p.length - 1; i >= 0; i--) c.lineTo(p[i][0] * hr, p[i][2] * vr);
+              c.closePath(); c.fillStyle = it.fill; c.fill();
+            }
           }
-          for (const b of g.boxes) {
-            if (b.x0 == null || b.x1 == null || b.y0 == null || b.y1 == null || !b.fill) continue;
-            c.fillStyle = b.fill;
-            c.fillRect(b.x0 * hr, b.y0 * vr, (b.x1 - b.x0) * hr, (b.y1 - b.y0) * vr);
-          }
+          c.restore();
           return;
         }
-        c.save();
-        for (const s of g.segs) {
-          if (s.x0 == null || s.x1 == null || s.y == null) continue;
-          c.strokeStyle = s.color; c.lineWidth = Math.max(1, s.width * hr);
-          c.setLineDash(s.dash ? [6 * hr, 4 * hr] : []);
-          c.beginPath(); c.moveTo(s.x0 * hr, Math.round(s.y * vr) + 0.5); c.lineTo(s.x1 * hr, Math.round(s.y * vr) + 0.5); c.stroke();
+        const font = (sz, w = 600) => `${w} ${sz * vr}px -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif`;
+        const placed = []; // 已放置的标签矩形，后放的往下让，避免叠在一起
+        const label = (txt, x, y, color, align = "left", sz = 10.5) => {
+          c.font = font(sz);
+          const tw = c.measureText(txt).width, h = (sz + 5) * vr, pad = 3 * hr;
+          let px = align === "right" ? x - tw - 2 * pad : x, py = y;
+          for (let guard = 0; guard < 6; guard++) {
+            const hit = placed.find((r) => px < r.x + r.w && px + tw + 2 * pad > r.x && py < r.y + r.h && py + h > r.y);
+            if (!hit) break;
+            py = hit.y + hit.h + 1;
+          }
+          placed.push({ x: px, y: py, w: tw + 2 * pad, h });
+          c.fillStyle = "rgba(14,17,23,.78)"; c.fillRect(px, py, tw + 2 * pad, h);
+          c.fillStyle = color; c.textBaseline = "middle"; c.fillText(txt, px + pad, py + h / 2);
+        };
+        const stroke = (color, width, dash) => {
+          c.strokeStyle = color; c.lineWidth = Math.max(1, width * hr);
+          c.setLineDash(dash ? (dash === 2 ? [2 * hr, 3 * hr] : [6 * hr, 4 * hr]) : []);
+        };
+        const later = []; // 文字最后画，压在所有线上面
+        for (const it of g) {
+          if (it.t === "rect") {
+            if (!ok(it.x0, it.x1, it.y0, it.y1)) continue;
+            if (it.stroke) {
+              stroke(it.stroke, it.width ?? 1, it.dash);
+              if (it.frame) c.strokeRect(it.x0 * hr, it.y0 * vr, (it.x1 - it.x0) * hr, (it.y1 - it.y0) * vr);
+              else for (const y of [it.y0, it.y1]) { c.beginPath(); c.moveTo(it.x0 * hr, Math.round(y * vr) + 0.5); c.lineTo(it.x1 * hr, Math.round(y * vr) + 0.5); c.stroke(); }
+            }
+            if (it.label) later.push(() => it.la === "left"
+              ? label(it.label, it.x0 * hr + 4 * hr, it.y0 * vr + 2 * vr, it.lc ?? it.stroke)
+              : label(it.label, it.x1 * hr - 4 * hr, it.y0 * vr + 2 * vr, it.lc ?? it.stroke, "right"));
+          } else if (it.t === "line") {
+            if (!ok(it.x0, it.x1, it.y0, it.y1)) continue;
+            stroke(it.color, it.width ?? 1, it.dash);
+            c.beginPath(); c.moveTo(it.x0 * hr, it.y0 * vr); c.lineTo(it.x1 * hr, it.y1 * vr); c.stroke();
+            if (it.label) later.push(() => {
+              const lx = it.la === "mid" ? (it.x0 + it.x1) / 2 : it.x1, ly = it.la === "mid" ? (it.y0 + it.y1) / 2 : it.y1;
+              label(it.label, lx * hr + (it.la === "mid" ? -10 * hr : -4 * hr), ly * vr - 17 * vr, it.lc ?? it.color, it.la === "mid" ? "left" : "right", 10);
+            });
+          } else if (it.t === "poly") {
+            const p = it.xy;
+            for (let i = 1; i < p.length; i++) {
+              if (!ok(...p[i - 1], ...p[i])) continue;
+              stroke(it.color, it.width ?? 1, it.dashLast && i === p.length - 1 ? 1 : it.dash);
+              c.beginPath(); c.moveTo(p[i - 1][0] * hr, p[i - 1][1] * vr); c.lineTo(p[i][0] * hr, p[i][1] * vr); c.stroke();
+            }
+          } else if (it.t === "text") {
+            if (!ok(it.x, it.y)) continue;
+            later.push(() => {
+              const sz = it.size ?? 10, off = (it.off ?? 8) * vr;
+              c.font = font(sz, it.circle ? 700 : 600);
+              const tw = c.measureText(it.text).width, x = it.x * hr;
+              const y = it.pos === "below" ? it.y * vr + off + sz * vr / 2 : it.y * vr - off - sz * vr / 2;
+              c.textBaseline = "middle"; c.textAlign = "center";
+              if (it.circle) {
+                const r = Math.max(tw / 2 + 3 * hr, (sz / 2 + 3) * vr);
+                c.beginPath(); c.arc(x, y, r, 0, Math.PI * 2); c.fillStyle = "rgba(14,17,23,.9)"; c.fill();
+                c.setLineDash([]); c.lineWidth = 1.2 * hr; c.strokeStyle = it.color; c.stroke();
+              }
+              c.fillStyle = it.color; c.fillText(it.text, x, y + 0.5 * vr);
+              c.textAlign = "left";
+            });
+          } else if (it.t === "vline") {
+            if (!ok(it.x)) continue;
+            stroke(it.color, 1, 1);
+            c.beginPath(); c.moveTo(it.x * hr, 0); c.lineTo(it.x * hr, bitmapSize.height); c.stroke();
+            if (it.label) later.push(() => label(it.label, it.x * hr + 4 * hr, 4 * vr, it.color));
+          }
         }
         c.setLineDash([]);
-        for (const b of g.boxes) {
-          if (b.x0 == null || b.x1 == null || b.y0 == null || b.y1 == null) continue;
-          c.strokeStyle = b.stroke; c.lineWidth = 2 * hr;
-          for (const y of [b.y0, b.y1]) { c.beginPath(); c.moveTo(b.x0 * hr, y * vr); c.lineTo(b.x1 * hr, y * vr); c.stroke(); }
-          c.lineWidth = 1 * hr; c.setLineDash([3 * hr, 3 * hr]);
-          c.beginPath(); c.moveTo(b.x0 * hr, b.y0 * vr); c.lineTo(b.x0 * hr, b.y1 * vr); c.stroke(); c.setLineDash([]);
-          if (b.label) {
-            c.font = `600 ${11 * vr}px -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif`;
-            const tw = c.measureText(b.label).width, px = b.x0 * hr + 6 * hr, py = b.y0 * vr + 5 * vr;
-            c.fillStyle = "rgba(14,17,23,.82)"; c.fillRect(px - 3 * hr, py, tw + 6 * hr, 16 * vr);
-            c.fillStyle = b.stroke; c.textBaseline = "top"; c.fillText(b.label, px, py + 2.5 * vr);
-          }
-        }
-        for (const v of g.vlines) {
-          if (v.x == null) continue;
-          c.strokeStyle = v.color; c.lineWidth = 1 * hr; c.setLineDash([4 * hr, 4 * hr]);
-          c.beginPath(); c.moveTo(v.x * hr, 0); c.lineTo(v.x * hr, bitmapSize.height); c.stroke(); c.setLineDash([]);
-          if (v.label) {
-            c.font = `${10 * vr}px -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif`;
-            c.fillStyle = v.color; c.textBaseline = "top"; c.fillText(v.label, v.x * hr + 4 * hr, 6 * vr);
-          }
-        }
+        later.forEach((f) => f());
         c.restore();
       });
     }
   }
-  const fillLayer = new StructLayer("bottom"), lineLayer = new StructLayer("normal");
+  const fillLayer = new Overlay("bottom"), lineLayer = new Overlay("normal");
+  const fillLayer3 = new Overlay("bottom"), lineLayer3 = new Overlay("normal");
+
+  // ── 价格结构（structure.js）：每个周期一份，只用已收盘K线，按最后一根收盘时间缓存 ──
+  const TFS = {
+    "3m": { key: "m3", sec: 180, label: "3m" },
+    "15m": { key: "ltf", sec: LTF_SEC, label: "15m" },
+    "1h": { key: "htf", sec: 3600, label: "1h" },
+    "4h": { key: "h4", sec: 4 * 3600, label: "4h" },
+    "1d": { key: "d1", sec: 86400, label: "日线" },
+    "1w": { key: "w1", sec: 7 * 86400, label: "周线" },
+  };
+  // 每个主图周期投影哪两级大周期（近的那级每侧 2 个区，远的那级每侧 1 个）
+  const HTF_OF = { "3m": ["15m", "1h"], "15m": ["1h", "4h"], "1h": ["4h", "1d"], "4h": ["1d", "1w"], "1d": ["1w"] };
+  // 周线由日线合成（周一 00:00 UTC 开盘），不额外请求
+  function weeklyOf(d) {
+    const d1 = d.d1 ?? [];
+    const ck = `${d1.length}|${d1[d1.length - 1]?.time}|${d1[d1.length - 1]?.close}`;
+    if (d._w1ck === ck) return d._w1;
+    const out = [];
+    for (const x of d1) {
+      const day = Math.floor(x.time / 86400), wk = (Math.floor((day + 3) / 7) * 7 - 3) * 86400;
+      const w = out[out.length - 1];
+      if (w && w.time === wk) { w.high = Math.max(w.high, x.high); w.low = Math.min(w.low, x.low); w.close = x.close; w.volume += x.volume; }
+      else out.push({ time: wk, open: x.open, high: x.high, low: x.low, close: x.close, volume: x.volume });
+    }
+    d._w1 = out; d._w1ck = ck;
+    return out;
+  }
+  const barsOf = (d, tf) => (tf === "1w" ? weeklyOf(d) : d?.[TFS[tf].key] ?? []);
+  const stCache = new Map();
+  function structOf(sym, tf) {
+    const d = state.data[sym], cfg = TFS[tf];
+    if (!d || !cfg) return null;
+    const all = barsOf(d, tf), nowS = Date.now() / 1000;
+    let n = all.length;
+    while (n > 0 && all[n - 1].time + cfg.sec > nowS) n--; // 去掉正在形成的K线
+    if (n < 30) return null;
+    const ck = `${sym}|${tf}|${n}|${all[n - 1].time}`;
+    if (stCache.has(ck)) return stCache.get(ck);
+    const S = Structure.analyze(all.slice(Math.max(0, n - 1500), n), cfg.sec);
+    if (S) S.tf = tf;
+    if (stCache.size > 80) stCache.clear();
+    stCache.set(ck, S);
+    return S;
+  }
+
+  // 图层图元生成。k = 图上的K线（含正在形成的），sec = 图的周期
+  const COL = {
+    res: { fill: "rgba(239,83,80,.13)", stroke: "rgba(239,83,80,.8)" },
+    sup: { fill: "rgba(38,166,154,.13)", stroke: "rgba(38,166,154,.8)" },
+    mid: { fill: "rgba(245,197,66,.12)", stroke: "rgba(245,197,66,.8)" },
+    htf: [{ fill: "rgba(188,148,255,.10)", stroke: "rgba(188,148,255,.85)" }, { fill: "rgba(255,120,200,.08)", stroke: "rgba(255,120,200,.75)" }],
+    zs: { fill: "rgba(255,170,40,.09)", stroke: "rgba(255,170,40,.9)" },
+    up: "#26a69a", dn: "#ef5350", broken: "rgba(150,160,180,.7)", ch: "rgba(76,141,255,.85)", chFill: "rgba(76,141,255,.06)",
+    swing: "rgba(210,215,230,.55)", wave: "#00d9ff", bos: "#f5c542",
+  };
+  function chartFrame(k, sec) {
+    const T = (t) => t + TZ;
+    const snap = (t) => {
+      if (t <= k[0].time) return k[0].time;
+      let lo = 0, hi = k.length - 1;
+      while (lo < hi) { const m = (lo + hi + 1) >> 1; if (k[m].time <= t) lo = m; else hi = m - 1; }
+      return k[lo].time;
+    };
+    const lastT = k[k.length - 1].time;
+    return { T, snap, lastT, futEnd: lastT + FWD * sec, t0: k[0].time };
+  }
+  // 一条斜线（趋势线/通道线）从 ta 画到 tb；起点早于图上第一根时截到第一根
+  function slopeLine(F, L, ta, tb, extra) {
+    const a = Math.max(F.snap(ta), F.t0);
+    return { t: "line", t0: F.T(a), p0: Structure.lineAt(L, a), t1: F.T(tb), p1: Structure.lineAt(L, tb), ...extra };
+  }
+  const fmtTouch = (z) => `×${z.touches}${z.flip ? "⇅" : ""}`;
+
+  function structItems(S, k, sec, Ly, o = {}) {
+    const items = [], tags = [];
+    if (!S || !k.length) return { items, tags };
+    const F = chartFrame(k, sec), { T, snap, futEnd } = F;
+    const inChart = (t) => t >= F.t0;
+    // 波段
+    if (Ly.swing) {
+      const sw = S.swings.filter((s) => inChart(s.time));
+      const pts = sw.map((s) => ({ time: T(s.time), price: s.price }));
+      if (S.tentative && inChart(S.tentative.time)) pts.push({ time: T(S.tentative.time), price: S.tentative.price });
+      items.push({ t: "poly", pts, color: COL.swing, width: 1.2, dashLast: !!S.tentative });
+      for (const s of sw.slice(-16)) {
+        const good = s.lab === "HH" || s.lab === "HL";
+        items.push({ t: "text", time: T(s.time), price: s.price, text: s.lab, pos: s.type === "H" ? "above" : "below", color: good ? "rgba(38,166,154,.95)" : "rgba(239,83,80,.95)", size: 9.5, off: 6 });
+      }
+    }
+    // BOS / CHoCH：从被突破的那个摆动点画到突破K线
+    if (Ly.bos) {
+      for (const e of S.events.filter((x) => inChart(x.from.time)).slice(-5)) {
+        const color = e.kind === "CHoCH" ? COL.bos : e.dir > 0 ? "rgba(38,166,154,.8)" : "rgba(239,83,80,.8)";
+        items.push({ t: "line", t0: T(e.from.time), p0: e.price, t1: T(e.time), p1: e.price, color, width: 1, dash: 2, label: `${e.kind}${e.dir > 0 ? "↑" : "↓"}`, la: "mid", lc: color });
+      }
+    }
+    // 中枢：最近 3 个，当前（还在延伸的）中枢画到右边
+    if (Ly.zs) {
+      // 只画最近 2 个：最后一个实线带标签，前一个淡色虚线不带标签
+      const list = S.zs.filter((z) => z.t1 >= F.t0).slice(-2);
+      list.forEach((z, idx) => {
+        const active = z === S.activeZs, lastOne = idx === list.length - 1;
+        items.push({
+          t: "rect", t0: T(snap(z.t0)), t1: T(active ? futEnd : snap(z.t1)), lo: z.zd, hi: z.zg,
+          fill: lastOne ? COL.zs.fill : "rgba(255,170,40,.04)", stroke: lastOne ? COL.zs.stroke : "rgba(255,170,40,.45)",
+          width: active ? 1.5 : 1, dash: active ? 0 : 1, frame: true,
+          label: lastOne ? `${active ? "当前" : ""}中枢 ${z.n}笔` : "", la: "left",
+        });
+      });
+    }
+    // 支撑压力区
+    if (Ly.zone) {
+      const z = S.zones;
+      // 价格挂在价格轴上，图里的标签只写性质；和大周期区重叠的标 "+1h" 等（多周期共振位）
+      const draw = (x, c, nm) => {
+        const cf = [...new Set((o.htfZones ?? []).filter((h) => h.lo <= x.hi && h.hi >= x.lo).map((h) => h.tf))].map((t) => "+" + TFS[t].label).join("");
+        items.push({ t: "rect", t0: T(snap(x.from)), t1: T(futEnd), lo: x.lo, hi: x.hi, fill: c.fill, stroke: c.stroke, width: x.touches >= 3 || cf ? 1.8 : 1,
+          label: `${nm}${fmtTouch(x)}${cf}`, la: "right" });
+        tags.push([x.price, c.stroke, `${nm}${cf}`]);
+      };
+      z.above.forEach((x) => draw(x, COL.res, "压"));
+      z.below.forEach((x) => draw(x, COL.sup, "撑"));
+      if (z.inside) draw(z.inside, COL.mid, "区内");
+    }
+    // 趋势线 + 通道
+    if (Ly.tl || Ly.ch) {
+      const tl = S.tl;
+      const tlLine = (L, color) => slopeLine(F, L, L.a.time, futEnd, {
+        color, width: L.strong ? 2 : 1.3, dash: L.strong ? 0 : 1,
+        label: o.narrow ? `${L.touches}触` : `${L.side === "up" ? "上升线" : "下降线"} ${L.touches}触`, lc: color,
+      });
+      if (Ly.tl) {
+        if (tl.up) items.push(tlLine(tl.up, COL.up));
+        if (tl.down) items.push(tlLine(tl.down, COL.dn));
+        for (const B of [tl.upBroken, tl.downBroken]) if (B) {
+          items.push(slopeLine(F, B, B.a.time, B.breakTime, { color: COL.broken, width: 1.2, dash: 1 }));
+          items.push({ t: "text", time: T(snap(B.breakTime)), price: Structure.lineAt(B, B.breakTime), text: "破", pos: B.side === "up" ? "below" : "above", color: COL.broken, size: 10 });
+        }
+      }
+      const ch = S.channel;
+      if (Ly.ch && ch) {
+        if (ch.base) {
+          const P = { t0: ch.base.t0, p0: ch.base.p0 + ch.offset, slope: ch.base.slope };
+          items.push(slopeLine(F, P, ch.base.a.time, futEnd, { color: COL.ch, width: 1.3, dash: 1, label: o.narrow ? "" : `${ch.kind} ${Math.round(ch.pos * 100)}%`, lc: COL.ch }));
+          if (!Ly.tl) items.push(tlLine(ch.base, COL.ch));
+          const ts = k.filter((x) => x.time >= ch.base.a.time).map((x) => x.time).concat([futEnd]);
+          items.push({ t: "band", fill: COL.chFill, pts: ts.map((t) => { const b = Structure.lineAt(ch.base, t); return { time: T(t), up: Math.max(b, b + ch.offset), dn: Math.min(b, b + ch.offset) }; }) });
+        } else if (ch.up && ch.dn) {
+          const t0 = Math.max(ch.up.a.time, ch.dn.a.time);
+          const ts = k.filter((x) => x.time >= t0).map((x) => x.time).concat([futEnd]);
+          items.push({ t: "band", fill: "rgba(245,197,66,.06)", pts: ts.map((t) => ({ time: T(t), up: Structure.lineAt(ch.dn, t), dn: Structure.lineAt(ch.up, t) })) });
+          if (!Ly.tl) { items.push(tlLine(ch.up, COL.up)); items.push(tlLine(ch.dn, COL.dn)); }
+          items.push({ t: "text", time: T(snap(t0)), price: Structure.lineAt(ch.dn, t0), text: ch.kind, pos: "above", color: "#f5c542", size: 10.5 });
+        }
+      }
+    }
+    // 波浪
+    if (Ly.wave && S.wave) {
+      const w = S.wave, pts = w.pts.filter((p) => inChart(p.time));
+      items.push({ t: "poly", pts: pts.map((p) => ({ time: T(p.time), price: p.price })), color: COL.wave, width: 1.6, dashLast: !!w.pts[w.pts.length - 1].tentative });
+      w.pts.forEach((p, i) => {
+        if (!inChart(p.time)) return;
+        const isHigh = i > 0 ? p.price > w.pts[i - 1].price : p.price > w.pts[1].price;
+        items.push({ t: "text", time: T(p.time), price: p.price, text: w.labels[i], pos: isHigh ? "above" : "below", color: COL.wave, circle: true, size: 10, off: o.swingOn ? 18 : 9 });
+      });
+      if (w.next?.target) {
+        const last = w.pts[w.pts.length - 1];
+        items.push({ t: "line", t0: T(snap(last.time)), p0: w.next.target, t1: T(futEnd), p1: w.next.target, color: COL.wave, width: 1, dash: 2, label: `${w.next.txt.replace(/^可能/, "")} 参考 ${fmtPrice(w.next.target)}`, lc: COL.wave });
+      }
+      if (w.next?.limit) {
+        const last = w.pts[w.pts.length - 1];
+        items.push({ t: "line", t0: T(snap(last.time)), p0: w.next.limit, t1: T(futEnd), p1: w.next.limit, color: "rgba(0,217,255,.5)", width: 1, dash: 1, label: w.next.limitTxt, lc: "rgba(0,217,255,.7)" });
+      }
+    }
+    return { items, tags };
+  }
+  // 大周期支撑压力区投影到本图：横贯整张图的半透明色带
+  function htfItems(list, k, sec, o = {}) {
+    const items = [], tags = [];
+    if (!k.length) return { items, tags };
+    const F = chartFrame(k, sec);
+    // 每级大周期每侧只取 1 个；和本周期区（o.own）或更近一级已画的区重叠的不再单独画 ——
+    // 重叠的那个本周期区会标上 "+1h"，表示多周期共振
+    const taken = [...(o.own ?? [])];
+    const overlaps = (z) => taken.some((t) => t.lo <= z.hi && t.hi >= z.lo);
+    list.forEach(({ S, tf }, rank) => {
+      if (!S) return;
+      const c = COL.htf[rank] ?? COL.htf[1], nm = TFS[tf].label;
+      const draw = (z, isRes) => {
+        items.push({ t: "rect", t0: F.T(F.snap(z.from)), t1: F.T(F.futEnd), lo: z.lo, hi: z.hi, fill: c.fill, stroke: c.stroke, dash: 1,
+          label: `${nm}${isRes ? "压" : "撑"}${fmtTouch(z)}`, la: "right" });
+        tags.push([z.price, c.stroke, `${nm}${isRes ? "压" : "撑"}`]);
+        taken.push(z);
+      };
+      for (const [arr, isRes] of [[S.zones.above, true], [S.zones.below, false]]) {
+        const z = arr.find((x) => !overlaps(x));
+        if (z) draw(z, isRes);
+      }
+      // 3m 副图上额外投影 15m 的趋势线（3m 就是在 15m 结构里找入场点）
+      if (o.withTl && rank === 0) for (const L of [S.tl.up, S.tl.down]) if (L && L.a.time >= k[0].time - 50 * S.barSec) {
+        items.push(slopeLine(F, L, L.a.time, F.futEnd, { color: c.stroke, width: 1.5, dash: L.strong ? 0 : 1, label: `${nm}趋势线`, lc: c.stroke }));
+      }
+    });
+    return { items, tags };
+  }
 
   // 高周期结构的唯一来源：图表和面板都从这里取，保证两边数字一致。
   // rgN 用 30/90，和 strategy.js 里 regimeN、quant/ 第 3 层实验的口径一致
   const STRUCT = {
+    htf: { label: "1h", sec: 3600, chN: 360, rgN: 90 },
     d1: { label: "日线", sec: 86400, chN: 120, rgN: 30 },
     h4: { label: "4h", sec: 4 * 3600, chN: 360, rgN: 90 },
   };
@@ -597,6 +886,7 @@
     return out;
   }
   let chart, candle, vol, ema9S, ema21S, stUpS, stDnS, priceLines = [];
+  let chart3, candle3, fut3, priceLines3 = [], sub3Key = "", sub3Sym = null;
   // 回归通道：当前通道（中轴 + 上下轨）+ 当时实际的通道轨迹（上下轨）+ 底部形态色带
   let chMidS, chUpS, chDnS, trUpS, trDnS, regimeS, futS;
   function initChart() {
@@ -642,10 +932,27 @@
     trDnS = chart.addLineSeries({ ...chOpt, color: "rgba(150,170,190,.55)", lineWidth: 1, lineStyle: 1 });
     // 只用来把时间轴往右撑出 FWD 根空白（通道外推、区间框延伸都画在这里）
     futS = chart.addLineSeries({ ...chOpt, visible: false });
+
+    // 3m 副图：短线模式下 15m 主图下方的入场确认图
+    chart3 = LightweightCharts.createChart($("chart3"), {
+      layout: { background: { color: "#0e1117" }, textColor: "#9aa3b5" },
+      grid: { vertLines: { color: "#161b24" }, horzLines: { color: "#161b24" } },
+      crosshair: { mode: 0 },
+      rightPriceScale: { borderColor: "#262d3b", minimumWidth: 72 },
+      timeScale: { borderColor: "#262d3b", timeVisible: true, secondsVisible: false, rightOffset: 8 },
+      autoSize: true,
+    });
+    candle3 = chart3.addCandlestickSeries({ upColor: "#26a69a", downColor: "#ef5350", borderVisible: false, wickUpColor: "#26a69a", wickDownColor: "#ef5350" });
+    candle3.priceScale().applyOptions({ scaleMargins: { top: 0.08, bottom: 0.06 } });
+    candle3.attachPrimitive(fillLayer3);
+    candle3.attachPrimitive(lineLayer3);
+    fut3 = chart3.addLineSeries({ ...chOpt, visible: false });
+    // 两张图价格轴等宽，主图和副图的K线才上下对齐
+    chart.applyOptions({ rightPriceScale: { minimumWidth: 72 } });
   }
 
   // 15m 主图时「趋势通道」面板可以独立选的周期
-  const CH_TF = { "1d": { label: "日线", key: "d1" }, "4h": { label: "4h", key: "h4" } };
+  const CH_TF = { "1d": { label: "日线", key: "d1" }, "4h": { label: "4h", key: "h4" }, "1h": { label: "1h", key: "htf" } };
   const FWD = 8; // 通道外推 / 区间框向右延伸的根数（按主图周期）
 
   function syncChartTfBtns() {
@@ -655,7 +962,8 @@
   // 主图可切换的周期（通道/区间的参数统一在 STRUCT 里）
   const CHART_TF = {
     "15m": { label: "15m", key: "ltf", sec: LTF_SEC, bars: 160 },
-    "4h": { label: "4h", key: "h4", sec: 4 * 3600, bars: 400 },
+    "1h": { label: "1h", key: "htf", sec: 3600, bars: 240 },
+    "4h": { label: "4h", key: "h4", sec: 4 * 3600, bars: 240 },
     "1d": { label: "日线", key: "d1", sec: 86400, bars: 150 },
   };
 
@@ -758,16 +1066,20 @@
     stUpS.setData(k.map((x, i) => (ind.st.dir[i] === 1 ? { time: T(x.time), value: ind.st.line[i] } : { time: T(x.time) })));
     stDnS.setData(k.map((x, i) => (ind.st.dir[i] === -1 ? { time: T(x.time), value: ind.st.line[i] } : { time: T(x.time) })));
 
+    const Ly = state.layers;
+    [ema9S, ema21S, stUpS, stDnS].forEach((x) => x.applyOptions({ visible: !!Ly.ma }));
+
     // 信号标记只在 15m 图上有意义（信号就是 15m 收盘判定的）
-    const markers = !isLtf ? [] : d.res.signals.map((s) => ({
+    const sigOn = isLtf && Ly.sig;
+    const markers = !sigOn ? [] : d.res.signals.map((s) => ({
       time: T(s.time),
       position: s.side > 0 ? "belowBar" : "aboveBar",
       color: s.side > 0 ? "#26a69a" : "#ef5350",
       shape: s.side > 0 ? "arrowUp" : "arrowDown",
       text: `${s.side > 0 ? "多" : "空"}${s.score}`,
     }));
-    if (isLtf && d.exit) markers.push({ time: T(d.exit.time), position: d.exit.side > 0 ? "aboveBar" : "belowBar", color: "#f5a623", shape: "circle", text: "弱" });
-    if (isLtf) for (const ev of d.rejections ?? []) markers.push({
+    if (sigOn && d.exit) markers.push({ time: T(d.exit.time), position: d.exit.side > 0 ? "aboveBar" : "belowBar", color: "#f5a623", shape: "circle", text: "弱" });
+    if (sigOn) for (const ev of d.rejections ?? []) markers.push({
       time: T(ev.time), position: ev.isRes ? "aboveBar" : "belowBar", color: "#f5a623",
       shape: "square", size: ev.first ? 1 : 0.6, text: ev.first ? "🧱" : "",
     });
@@ -781,71 +1093,70 @@
     // 只在价格轴上挂标签，线本身由 lineLayer 从"它开始存在的那根K线"画起
     const axisTag = (price, color, title) =>
       priceLines.push(candle.createPriceLine({ price, color, title, lineVisible: false, axisLabelVisible: true }));
-    // 把任意时刻对齐到图上存在的K线时间（primitive 只能把图上有的时间换成坐标）
-    const snap = (t) => {
-      if (t <= k[0].time) return k[0].time;
-      let lo = 0, hi = k.length - 1;
-      while (lo < hi) { const m = (lo + hi + 1) >> 1; if (k[m].time <= t) lo = m; else hi = m - 1; }
-      return k[lo].time;
-    };
-    const lastT = k[k.length - 1].time, futEnd = lastT + FWD * ctf.sec;
+    const F = chartFrame(k, ctf.sec), { snap, lastT, futEnd } = F;
     futS.setData(Array.from({ length: FWD }, (_, i) => ({ time: T(lastT + (i + 1) * ctf.sec) })));
-    const segs = [], boxes = [], bands = [], vlines = [];
-
-    // 15m 级支撑压力位：只在 15m 图上画。高周期图上这些位太密、也不是那个尺度该看的东西
-    const kl = isLtf ? keyLevels(d) : { above: [], below: [] };
-    // ★ 级回测和随机价位差不多，不画；★★★ 用粗实线强调
-    const drawLv = (l, isRes) => {
-      if (l.strength < 3) return;
-      const strong = l.strength >= 5;
-      const color = isRes ? (strong ? "rgba(239,83,80,.95)" : "rgba(239,83,80,.45)") : strong ? "rgba(38,166,154,.95)" : "rgba(38,166,154,.45)";
-      const name = narrowUi
-        ? `${strong ? "强" : ""}${isRes ? "压" : "撑"}${stars(l)}`
-        : `${strong ? "强" : ""}${isRes ? "压力" : "支撑"}${stars(l)}${l.tags.length ? " " + l.tags.join("/") : ""}`;
-      add(l.price, color, name, strong ? 0 : 1, strong ? 3 : 1);
-    };
-    kl.above.forEach((l) => drawLv(l, true));
-    kl.below.forEach((l) => drawLv(l, false));
-
-    // 高周期关键位（4h + 日线）。硬位（日线/周高低参与）紫色粗线，软位（纯 4h）灰紫细线
+    const items = [];
     const pxNow = k[k.length - 1].close, atrNow = ind.atr[ind.atr.length - 1];
     const nowSec = Date.now() / 1000;
-    // 条数：15m 宽屏 3+3；高周期图或窄屏 2+2。
-    // 日线尺度上离现价 5% 开外的位参考价值很低，而标签会把右侧 K 线盖掉
-    const nLv = (!isLtf || narrowUi) ? 2 : 3;
-    const hLv = Levels.htf(d.h4, d.d1, nowSec).filter((l) => Math.abs(l.price - pxNow) <= 15 * atrNow);
-    const pick = (arr, n) => arr.slice(0, n);
-    [...pick(hLv.filter((l) => l.price > pxNow).sort((a, b) => a.price - b.price), nLv),
-     ...pick(hLv.filter((l) => l.price <= pxNow).sort((a, b) => b.price - a.price), nLv)]
-      .forEach((l) => {
-        const isRes = l.price > pxNow;
-        const nm = narrowUi
-          ? `${l.hard ? "硬" : ""}${isRes ? "压" : "撑"}`
-          : `${l.srcs.join("+")}${isRes ? "压力" : "支撑"}`;
-        const color = l.hard ? "rgba(188,148,255,.98)" : "rgba(188,148,255,.62)";
-        axisTag(l.price, color, nm);
-        // 从最早那个摆动点开始画：在那之前这个位还不存在
-        segs.push({ t0: T(snap(l.from)), t1: T(futEnd), price: l.price, color, width: l.hard ? 2.5 : 1.5 });
-      });
 
-    // ── 趋势通道 / 震荡区间 ──────────────────────────────────────────────
-    // 4h/日线图：用该周期自己的结构；15m 图：用面板里选的日线/4h 结构（通常在屏幕外）
+    // ── 新结构图层（structure.js）：本周期 + 上两级周期投影 ─────────────────────
+    const S = structOf(sym, state.chartTf);
+    const htfList = Ly.htf ? (HTF_OF[state.chartTf] ?? []).map((tf) => ({ tf, S: structOf(sym, tf) })) : [];
+    const ownZ = S && Ly.zone ? [...S.zones.above, ...S.zones.below, ...(S.zones.inside ? [S.zones.inside] : [])] : [];
+    const htfZ = htfList.flatMap(({ tf, S: H }) => (H ? [...H.zones.above.slice(0, 2), ...H.zones.below.slice(0, 2)].map((z) => ({ ...z, tf })) : []));
+    const own = structItems(S, k, ctf.sec, Ly, { narrow: narrowUi, swingOn: !!Ly.swing, htfZones: htfZ });
+    const hi = Ly.htf ? htfItems(htfList, k, ctf.sec, { own: ownZ }) : { items: [], tags: [] };
+    // 大周期色带先画（在下面），本周期的线压在上面
+    items.push(...hi.items, ...own.items);
+    // 价格轴标签：太多会叠成一团，离现价 8 ATR 以外的不挂
+    for (const [p, c, t] of [...own.tags, ...hi.tags]) if (Math.abs(p - pxNow) <= 8 * atrNow) axisTag(p, c, narrowUi ? t.replace(/×.*/, "") : t);
+
+    // ── 旧版画法（策略价位 / 回归通道），默认关闭 ─────────────────────────────
+    if (Ly.old) {
+      // 15m 级支撑压力位：只在 15m 图上画。★ 级回测和随机价位差不多，不画；★★★ 用粗实线强调
+      const kl = isLtf ? keyLevels(d) : { above: [], below: [] };
+      const drawLv = (l, isRes) => {
+        if (l.strength < 3) return;
+        const strong = l.strength >= 5;
+        const color = isRes ? (strong ? "rgba(239,83,80,.95)" : "rgba(239,83,80,.45)") : strong ? "rgba(38,166,154,.95)" : "rgba(38,166,154,.45)";
+        const name = narrowUi
+          ? `${strong ? "强" : ""}${isRes ? "压" : "撑"}${stars(l)}`
+          : `${strong ? "强" : ""}${isRes ? "压力" : "支撑"}${stars(l)}${l.tags.length ? " " + l.tags.join("/") : ""}`;
+        add(l.price, color, name, strong ? 0 : 1, strong ? 3 : 1);
+      };
+      kl.above.forEach((l) => drawLv(l, true));
+      kl.below.forEach((l) => drawLv(l, false));
+      // 高周期关键位（4h + 日线）。硬位（日线/周高低参与）紫色粗线，软位（纯 4h）灰紫细线
+      const nLv = (!isLtf || narrowUi) ? 2 : 3;
+      const hLv = Levels.htf(d.h4, d.d1, nowSec).filter((l) => Math.abs(l.price - pxNow) <= 15 * atrNow);
+      [...hLv.filter((l) => l.price > pxNow).sort((a, b) => a.price - b.price).slice(0, nLv),
+       ...hLv.filter((l) => l.price <= pxNow).sort((a, b) => b.price - a.price).slice(0, nLv)]
+        .forEach((l) => {
+          const isRes = l.price > pxNow;
+          const nm = narrowUi ? `${l.hard ? "硬" : ""}${isRes ? "压" : "撑"}` : `${l.srcs.join("+")}${isRes ? "压力" : "支撑"}`;
+          const color = l.hard ? "rgba(188,148,255,.98)" : "rgba(188,148,255,.62)";
+          axisTag(l.price, color, nm);
+          items.push({ t: "line", t0: T(snap(l.from)), p0: l.price, t1: T(futEnd), p1: l.price, color, width: l.hard ? 2.5 : 1.5 });
+        });
+    }
+
+    // 回归通道 / Donchian 震荡框（旧版）
+    // 4h/日线/1h 图：用该周期自己的结构；15m 图：用面板里选的日线/4h 结构（通常在屏幕外）
     const sKey = isLtf ? (CH_TF[state.chTf] ?? CH_TF["1d"]).key : ctf.key;
-    const S0 = structureFor(sym, sKey);
+    const S0 = Ly.reg ? structureFor(sym, sKey) : null;
     const closeOf = (x) => Math.min(x.time + ctf.sec, nowSec); // 这根K线收盘的时刻（未收盘就是现在）
     if (S0 && S0.ch) {
       const ch = S0.ch;
-      // 当前通道：只画拟合窗口 + 向右外推 FWD 根。
-      // 不再往拟合窗口左边延伸 —— 那一段是拿后来的数据往回画的直线，没有任何意义
+      // 当前通道：只画拟合窗口 + 向右外推 FWD 根
       const times = k.filter((x) => x.time >= ch.from).map((x) => x.time);
       for (let i = 1; i <= FWD; i++) times.push(lastT + i * ctf.sec);
       const at = times.map((t) => ({ t, v: ch.lineAt(t) }));
       chMidS.setData(at.map(({ t, v }) => ({ time: T(t), value: v.mid })));
       chUpS.setData(at.map(({ t, v }) => ({ time: T(t), value: v.up })));
       chDnS.setData(at.map(({ t, v }) => ({ time: T(t), value: v.dn })));
-      bands.push({ fill: ch.slopeUp ? "rgba(0,217,255,.07)" : "rgba(255,110,110,.07)", pts: at.map(({ t, v }) => ({ time: T(t), up: v.up, dn: v.dn })) });
-      // 拟合起点：这条线左边没有数据支撑
-      if (ch.from >= k[0].time) vlines.push({ time: T(snap(ch.from)), color: "rgba(0,217,255,.45)", label: narrowUi ? "" : `通道起点 · ${S0.label}${ch.n}根` });
+      // 15m 图上日线/4h 通道比可见范围大一个量级，填充会把整张图染掉 —— 15m 上不画填充
+      if (!isLtf) items.push({ t: "band", fill: ch.slopeUp ? "rgba(0,217,255,.07)" : "rgba(255,110,110,.07)", pts: at.map(({ t, v }) => ({ time: T(t), up: v.up, dn: v.dn })) });
+      if (ch.from >= k[0].time) items.push({ t: "vline", time: T(snap(ch.from)), color: "rgba(0,217,255,.45)", label: narrowUi ? "" : `通道起点 · ${S0.label}${ch.n}根` });
       // 当时实际的通道：每根K线收盘时用当时的 n 根拟合，取右端点。这才是历史上真实能看到的位置
       const tr = k.map((x) => { const f = Levels.asOf(S0.fits, closeOf(x)); return f ? { time: T(x.time), ...Levels.evalFit(f, x.time) } : { time: T(x.time) }; });
       trUpS.setData(tr.map((p) => (p.up != null ? { time: p.time, value: p.up } : { time: p.time })));
@@ -853,33 +1164,25 @@
     } else {
       [chMidS, chUpS, chDnS, trUpS, trDnS].forEach((x) => x.setData([]));
     }
-
     // 底部形态色带：每根K线当时的判定（绿=趋势↑ 红=趋势↓ 橙=震荡），无未来函数
     regimeS.setData(S0 ? k.map((x) => {
       const r = Levels.asOf(S0.rfits, closeOf(x));
       return r ? { time: T(x.time), value: 1, color: r.trending ? (r.up ? "rgba(38,166,154,.85)" : "rgba(239,83,80,.85)") : "rgba(255,170,40,.85)" } : { time: T(x.time) };
     }) : []);
-
-    // 震荡区间：画成框，只覆盖算出它的那 rgN 根 + 向右延伸，不再横贯整张图
     const rg = S0?.rg;
     if (rg && !rg.trending) {
       const t0 = S0.src[S0.src.length - rg.n].time;
-      // 上下沿价格已经挂在价格轴上，框内只写区间性质，避免标签伸出框外盖住价格轴
       const span = S0.key === "d1" ? `近${rg.n}日` : `近${rg.n}根${S0.label}`;
-      const label = narrowUi ? `${span}震荡` : `${span}震荡 · 宽${rg.widthPct.toFixed(1)}% · 已${S0.streak}根`;
-      boxes.push({ t0: T(snap(t0)), t1: T(futEnd), hi: rg.hi, lo: rg.lo, fill: "rgba(255,170,40,.06)", stroke: "rgba(255,170,40,.95)", label });
-      const near = (p) => !isLtf || Math.abs(p - pxNow) <= 6 * atrNow;
-      if (near(rg.hi)) axisTag(rg.hi, "rgba(255,170,40,.95)", narrowUi ? "区间上" : "震荡上沿");
-      if (near(rg.lo)) axisTag(rg.lo, "rgba(255,170,40,.95)", narrowUi ? "区间下" : "震荡下沿");
+      const label = narrowUi ? `${span}震荡` : `${span}Donchian震荡 · 宽${rg.widthPct.toFixed(1)}%`;
+      items.push({ t: "rect", t0: T(snap(t0)), t1: T(futEnd), hi: rg.hi, lo: rg.lo, fill: isLtf ? null : "rgba(255,170,40,.05)", stroke: "rgba(255,170,40,.6)", dash: 1, label, la: "left" });
     }
-    // 15m 图上日线/4h 的通道和区间比可见范围大一个量级，框边不在屏幕内，只剩一层底色
-    // 把整张图染掉 —— 15m 上不画填充，靠底部色带和面板数字表达
-    fillLayer.set(isLtf ? { bands: [], boxes: [], segs: [], vlines: [] } : { bands, boxes, segs: [], vlines: [] });
-    lineLayer.set({ bands: [], boxes, segs, vlines });
+    fillLayer.set(items);
+    lineLayer.set(items);
 
     // 当前信号 / 持仓
     const last = d.res.signals[d.res.signals.length - 1], st = d.lastStatus;
-    if (last && st && st.code !== "done" && st.code !== "expired") {
+    if (!Ly.sig) { /* 信号图层关闭 */ }
+    else if (last && st && st.code !== "done" && st.code !== "expired") {
       add(last.entry, "#c9d1e0", "信号价", 0);
       if (st.code === "manage") {
         add(st.stop, "#f5a623", "移动止损", 0, 2);
@@ -901,6 +1204,69 @@
     }
     chartKey = chartKeyOf(d);
     renderOhlc();
+    renderSub(true);
+  }
+
+  // ── 3m 副图（短线模式）：3m 自己的结构 + 15m 的支撑压力区和趋势线投影 ──────────
+  const isShort = () => state.chartTf === "15m";
+  function renderSub(force) {
+    const wrap = $("subWrap");
+    if (!isShort()) { wrap.classList.add("off"); return; }
+    wrap.classList.remove("off");
+    const sym = state.active, d = state.data[sym];
+    const k = d?.m3 ?? [];
+    if (!k.length) { setHtml("subHead", '<span>3m 数据加载中…</span>'); return; }
+    const T = (t) => t + TZ, Ly = state.layers;
+    const key = `${sym}|${k.length}|${k[k.length - 1].time}|${JSON.stringify(Ly)}`;
+    if (!force && key === sub3Key) {
+      const x = k[k.length - 1];
+      candle3.update({ time: T(x.time), open: x.open, high: x.high, low: x.low, close: x.close });
+      return;
+    }
+    sub3Key = key;
+    const prec = decimals(k[k.length - 1].close);
+    candle3.applyOptions({ priceFormat: { type: "price", precision: prec, minMove: 10 ** -prec } });
+    candle3.setData(k.map((x) => ({ time: T(x.time), open: x.open, high: x.high, low: x.low, close: x.close })));
+    const lastT = k[k.length - 1].time;
+    fut3.setData(Array.from({ length: FWD }, (_, i) => ({ time: T(lastT + (i + 1) * 180) })));
+    const S3 = structOf(sym, "3m"), S15 = structOf(sym, "15m");
+    const narrow = matchMedia("(max-width: 900px)").matches;
+    // 副图上不画通道/波浪（3m 上这两样噪声太大），其余跟主图开关一致
+    const own3Z = S3 && Ly.zone ? [...S3.zones.above, ...S3.zones.below] : [];
+    const z15 = Ly.htf && S15 ? [...S15.zones.above.slice(0, 2), ...S15.zones.below.slice(0, 2)].map((z) => ({ ...z, tf: "15m" })) : [];
+    const own = structItems(S3, k, 180, { ...Ly, ch: 0, wave: 0 }, { narrow: true, swingOn: !!Ly.swing, htfZones: z15 });
+    const hi = Ly.htf ? htfItems([{ tf: "15m", S: S15 }], k, 180, { withTl: !!Ly.tl, own: own3Z }) : { items: [], tags: [] };
+    const items = [...hi.items, ...own.items];
+    fillLayer3.set(items);
+    lineLayer3.set(items);
+    priceLines3.forEach((pl) => candle3.removePriceLine(pl));
+    priceLines3 = [];
+    const atr = S3?.atrNow ?? 0, px = k[k.length - 1].close;
+    for (const [p, c, t] of [...own.tags, ...hi.tags]) if (!atr || Math.abs(p - px) <= 10 * atr)
+      priceLines3.push(candle3.createPriceLine({ price: p, color: c, title: t.replace(/×.*/, ""), lineVisible: false, axisLabelVisible: true }));
+    if (sub3Sym !== sym) {
+      const bars = Math.min(k.length, narrow ? 80 : 160);
+      chart3.timeScale().setVisibleLogicalRange({ from: k.length - bars, to: k.length + 8 });
+      sub3Sym = sym;
+    }
+    const cf = confirm3(S15, S3, k);
+    setHtml("subHead", `<span><b>3m 入场确认</b></span><span>${S3 ? biasHtml(S3) : "-"}</span>` +
+      (S3?.lastEv ? `<span>最近 ${evTxt(S3.lastEv)}</span>` : "") +
+      (cf ? `<span class="${cf.cls}">${cf.txt}</span>` : ""));
+  }
+
+  // 结构文字
+  const biasHtml = (S) => `<b class="${S.bias > 0 ? "long" : S.bias < 0 ? "short" : "wait"}">${S.biasTxt}</b>`;
+  const evTxt = (e, sec = 900) => `<span class="${e.dir > 0 ? "long" : "short"}">${e.kind}${e.dir > 0 ? "↑" : "↓"}</span> <span class="muted">${sec >= 14400 ? fmtTime(e.time).slice(0, 5) : fmtTime(e.time).slice(6)}</span>`;
+  // 3m 对 15m 的确认：15m 有方向时，3m 最近 20 根内出现同向 BOS/CHoCH = 确认；出现反向 CHoCH = 警告
+  function confirm3(S15, S3, k3) {
+    if (!S15 || !S3) return null;
+    const e = S3.lastEv, fresh = e && k3.length - 1 - k3.findIndex((x) => x.time === e.time) <= 20;
+    const dir = S15.bias;
+    if (!dir) return { txt: S15.activeZs ? "15m 在中枢里：3m 只做区间上下沿" : "15m 方向不明，3m 信号只看不做", cls: "muted" };
+    if (fresh && e.dir === dir) return { txt: `✔ 3m ${e.kind}${dir > 0 ? "↑" : "↓"} 与 15m 同向`, cls: dir > 0 ? "long" : "short" };
+    if (fresh && e.dir !== dir && e.kind === "CHoCH") return { txt: `⚠ 3m 逆 15m 出现 CHoCH，等 3m 结构转回`, cls: "wait" };
+    return { txt: `等 3m 出现${dir > 0 ? "向上" : "向下"}突破再确认`, cls: "muted" };
   }
 
   // ---------------- 面板渲染 ----------------
@@ -993,16 +1359,18 @@
     const sym = state.active, d = state.data[sym];
     const sess = sessionOf(sym);
     const lg = (c, t) => `<span><i style="background:${c}"></i>${t}</span>`;
-    setHtml("legend", state.chartTf === "15m"
-      ? lg("#f5c542", "EMA9") + lg("#4c8dff", "EMA21") +
-        '<span><i style="background:#26a69a"></i>/<i style="background:#ef5350"></i>Supertrend</span>' +
-        lg("rgba(0,217,255,.95)", "通道(现在)") + lg("rgba(150,170,190,.8)", "通道(当时)") +
-        '<span class="muted legend-note">▲▼ 信号 · ● 趋势转弱 · 红/绿 压力/支撑 · 紫 高周期位 · 🧱 强价位被拒 · 底部色带=当时形态</span>'
-      : lg("#f5c542", "EMA9") + lg("#4c8dff", "EMA21") +
-        '<span><i style="background:#26a69a"></i>/<i style="background:#ef5350"></i>Supertrend</span>' +
-        lg("rgba(0,217,255,.95)", "通道(现在)") + lg("rgba(150,170,190,.8)", "通道(当时)") + lg("rgba(255,170,40,.95)", "震荡区间") +
-        `<span class="muted legend-note">紫 高周期位（从形成处开始画）· 底部色带=当时形态 绿趋势↑ 红趋势↓ 橙震荡 · 指标均为${(CHART_TF[state.chartTf] ?? CHART_TF["15m"]).label}周期</span>`);
-    $("chartTitle").innerHTML = `${short(sym)} <span class="muted small">${CN_NAMES[sym] ?? ""} · ${MARKET_NAMES[marketOf(sym)]}永续 · ${(CHART_TF[state.chartTf] ?? CHART_TF["15m"]).label}${sess ? " · " + sess.txt : ""}</span>`;
+    const Ly = state.layers, htfs = (HTF_OF[state.chartTf] ?? []).map((t) => TFS[t].label).join("/");
+    const lgParts = [];
+    if (Ly.zone) lgParts.push(lg("rgba(239,83,80,.8)", "压力区") + lg("rgba(38,166,154,.8)", "支撑区"));
+    if (Ly.htf && htfs) lgParts.push(lg(COL.htf[0].stroke, `${htfs} 大周期区`));
+    if (Ly.tl) lgParts.push('<span class="muted">趋势线：实线≥3触 虚线=候选 灰=已破</span>');
+    if (Ly.zs) lgParts.push(lg(COL.zs.stroke, "中枢 ZD~ZG"));
+    if (Ly.ma) lgParts.push(lg("#f5c542", "EMA9") + lg("#4c8dff", "EMA21"));
+    if (Ly.sig && state.chartTf === "15m") lgParts.push('<span class="muted">▲▼ 信号 · ● 转弱 · 🧱 强价位被拒</span>');
+    lgParts.push('<span class="muted legend-note">结构图层只用已收盘K线 · 阈值未经收益回测，只做显示</span>');
+    setHtml("legend", lgParts.join(""));
+    $("chartTitle").innerHTML = `${short(sym)} <span class="muted small">${CN_NAMES[sym] ?? ""} · ${MARKET_NAMES[marketOf(sym)]}永续 · ${state.chartTf === "15m" ? "短线 15m+3m" : "长线 " + (CHART_TF[state.chartTf] ?? CHART_TF["15m"]).label}${sess ? " · " + sess.txt : ""}</span>`;
+    renderStructPanel();
     if (!d?.live) { setHtml("liveScore", `<span class="muted">${d?.error ?? "加载中…"}</span>`); return; }
     const L = d.live, p = d.res.params;
 
@@ -1225,6 +1593,84 @@
       <div class="bt-note">规则：信号收盘价入场；TP1(1R) 平一半、止损移保本，剩余半仓 ${p.trailAtr}×ATR 移动止损；同根K线同时碰到止损和止盈按止损算。手续费占止损 >${p.maxFeeR}R 的信号不发${p.market !== "crypto" ? "，股票周末不发" : ""}。已扣手续费 ${p.feePct}%，未计滑点和资金费率。${bt.open ? `另有 ${bt.open} 笔持仓中。` : ""}</div>`);
   }
 
+  // 价格结构面板：五个周期一览 + 当前主图周期的细节 + 多周期共振提示
+  function renderStructPanel() {
+    const sym = state.active, d = state.data[sym];
+    if (!d?.ltf?.length) { setHtml("structPanel", '<span class="muted small">加载中…</span>'); return; }
+    const isS = isShort(), main = state.chartTf;
+    const order = ["1d", "4h", "1h", "15m", "3m"];
+    const group = isS ? ["15m", "3m"] : ["1h", "4h", "1d"];
+    const St = Object.fromEntries(order.map((tf) => [tf, structOf(sym, tf)]));
+    const zsTxt = (S) => !S?.zs.length ? '<span class="muted">-</span>'
+      : S.zsPos === "inside" ? '<span class="wait">中枢内</span>' : S.zsPos === "above" ? '<span class="long">中枢上方</span>' : '<span class="short">中枢下方</span>';
+    const wvTxt = (S) => !S?.wave ? '<span class="muted">-</span>'
+      : `<span class="${S.wave.dir > 0 ? "long" : "short"}">${S.wave.kind === "abc" ? "ABC" : S.wave.nW + "浪"}${S.wave.dir > 0 ? "↑" : "↓"}</span>`;
+    let html = `<div class="st-row head"><span>周期</span><span>结构</span><span>最近突破</span><span>中枢</span><span>波浪</span></div>`;
+    for (const tf of order) {
+      const S = St[tf];
+      html += `<div class="st-row ${tf === main || (isS && tf === "3m") ? "cur" : group.includes(tf) ? "" : "dim"}"><span>${TFS[tf].label}</span>` +
+        (S ? `<span>${biasHtml(S)}</span><span>${S.lastEv ? evTxt(S.lastEv, S.barSec) : '<span class="muted">-</span>'}</span><span>${zsTxt(S)}</span><span>${wvTxt(S)}</span>`
+          : '<span class="muted">数据不足</span><span></span><span></span><span></span>') + "</div>";
+    }
+    // 共振
+    let res = null;
+    if (isS) {
+      const cf = confirm3(St["15m"], St["3m"], d.m3 ?? []);
+      const h1 = St["1h"]?.bias;
+      if (cf) res = { cls: cf.cls, txt: `${cf.txt}${h1 && St["15m"]?.bias && h1 !== St["15m"].bias ? "；但 1h 结构反向，按回调/反弹对待" : ""}` };
+    } else {
+      const b = ["1d", "4h", "1h"].map((t) => St[t]?.bias ?? 0);
+      if (b[0] && b[0] === b[1] && b[1] === b[2]) res = { cls: b[0] > 0 ? "long" : "short", txt: `日线/4h/1h 结构同向${b[0] > 0 ? "向上" : "向下"}` };
+      else if (b[0] && b[1] === b[0] && b[2] === -b[0]) res = { cls: "wait", txt: `日线/4h ${b[0] > 0 ? "向上" : "向下"}，1h 反向：大级别里的回调，等 1h 结构转回` };
+      else if (b[0] && b[1] === -b[0]) res = { cls: "wait", txt: `4h 与日线反向：日线级别的${b[0] > 0 ? "回调" : "反弹"}，或者趋势在转` };
+      else res = { cls: "muted", txt: "长线结构不一致 / 有周期在中枢里震荡" };
+    }
+    if (res) html += `<div class="resonance ${res.cls}">${res.txt}</div>`;
+    // 当前主图周期的细节
+    const S = St[main];
+    if (S) {
+      const px = d[TFS[main].key]?.[d[TFS[main].key].length - 1]?.close ?? S.close, nowS = Date.now() / 1000;
+      const zl = (z, cls, nm) => `<span class="${cls}">${nm} <b class="num">${fmtPrice(z.price)}</b></span> <span class="muted num">${fmtPct(z.price, px)} ${fmtTouch(z)}</span>`;
+      const rows = [];
+      const zz = S.zones;
+      rows.push(["压力", zz.above.length ? zz.above.map((z) => zl(z, "short", "")).join(" · ") : '<span class="muted">上方没有近的结构位</span>']);
+      rows.push(["支撑", zz.below.length ? zz.below.map((z) => zl(z, "long", "")).join(" · ") : '<span class="muted">下方没有近的结构位</span>']);
+      const tlv = (L, nm, cls) => L ? `<span class="${cls}">${nm} <b class="num">${fmtPrice(Structure.lineAt(L, nowS))}</b></span> <span class="muted">${L.touches}触${L.strong ? "" : "·候选"}</span>` : "";
+      const tls = [tlv(S.tl.up, "上升", "long"), tlv(S.tl.down, "下降", "short")].filter(Boolean);
+      const brk = [S.tl.upBroken && "上升线刚被跌破", S.tl.downBroken && "下降线刚被突破"].filter(Boolean);
+      rows.push(["趋势线", (tls.join(" · ") || '<span class="muted">无有效趋势线</span>') + (brk.length ? ` <span class="wait">${brk.join("，")}</span>` : "")]);
+      if (S.channel) rows.push(["通道", S.channel.base ? `${S.channel.kind} · 现价在 <b>${Math.round(S.channel.pos * 100)}%</b> <span class="muted">(0=下沿 100=上沿)</span>` : `<span class="wait">${S.channel.kind}</span> <span class="muted">两条趋势线同时有效</span>`]);
+      const z = S.zs[S.zs.length - 1];
+      if (z) rows.push(["中枢", `<b class="num">${fmtPrice(z.zd)} ~ ${fmtPrice(z.zg)}</b> <span class="muted">${z.n}笔 · 波动 ${fmtPrice(z.dd)}~${fmtPrice(z.gg)}${S.activeZs ? " · 仍在延伸" : ""}</span>`]);
+      if (S.wave) {
+        const w = S.wave, n = w.next;
+        rows.push(["波浪", `${w.kind === "abc" ? `5浪后 ABC 调整（${w.labels[w.labels.length - 1]}）` : `${w.dir > 0 ? "上升" : "下跌"}推动 第${w.nW}浪`} <span class="muted">吻合度 ${(w.score * 100).toFixed(0)}%</span>` +
+          (n ? `<br><span class="muted">${n.txt}${n.target ? ` · 参考 ${fmtPrice(n.target)}` : ""}${n.limit ? ` · ${n.limitTxt} ${fmtPrice(n.limit)}` : ""}</span>` : "")]);
+      }
+      html += `<div class="sub-h">${TFS[main].label} 细节 <span class="muted small">ATR ${fmtPrice(S.atrNow)} · 每笔约 ${S.avgLegBars.toFixed(0)} 根</span></div>` +
+        `<div class="st-detail">${rows.map(([a, b]) => `<div class="row"><span class="muted">${a}</span><span>${b}</span></div>`).join("")}</div>`;
+    }
+    html += `<div class="muted small" style="margin-top:6px">摆动点 = ATR ZigZag（反向走出约 2.2×ATR 才确认），所有图层都从同一套摆动点算出；
+      结构 = 最近两个高点/低点排列（HH+HL 上升、LH+LL 下降），在中枢里时判震荡。波浪只是"最符合铁律的一种数法"，不是预测。
+      <b>这些都没经过收益回测，不参与信号和止损。</b></div>`;
+    setHtml("structPanel", html);
+  }
+
+  function renderLayerBar() {
+    const chips = LAYERS.map((L, i) => (i === 8 ? '<span class="sep"></span>' : "") +
+      `<button class="chip${state.layers[L.id] ? " on" : ""}" data-layer="${L.id}" title="${L.tip}"><i style="background:${L.color}"></i>${L.name}</button>`).join("");
+    const presets = Object.keys(LAYER_PRESETS).map((k) => `<button class="chip preset" data-preset="${k}">${k}</button>`).join("");
+    $("layerBar").innerHTML = chips + '<span class="sep"></span>' + presets;
+  }
+  function layersChanged() {
+    store.save("layers", state.layers);
+    renderLayerBar();
+    chartKey = ""; sub3Key = "";
+    htmlCache.legend = null;
+    renderSide();
+    renderChart();
+  }
+
   function renderFeed() {
     $("feed").innerHTML = state.feed.length
       ? state.feed.map((f) => `<div class="item" data-sym="${f.sym}"><span class="muted num">${fmtTime(f.t)}</span> <b>${short(f.sym)}</b> ${f.html}</div>`).join("")
@@ -1262,9 +1708,18 @@
       store.save("chartTf", state.chartTf);
       syncChartTfBtns();
       htmlCache.chartTitle = null;
-      chartKey = "";
+      chartKey = ""; sub3Key = "";
       renderSide();
       renderChart();
+    });
+
+    // 图层开关 / 预设
+    $("layerBar").addEventListener("click", (e) => {
+      const b = e.target.closest("[data-layer],[data-preset]");
+      if (!b) return;
+      if (b.dataset.layer) state.layers[b.dataset.layer] = state.layers[b.dataset.layer] ? 0 : 1;
+      else state.layers = Object.fromEntries(LAYERS.map((L) => [L.id, LAYER_PRESETS[b.dataset.preset][L.id] ? 1 : 0]));
+      layersChanged();
     });
 
     // 趋势通道 / 震荡区间的周期切换（日线 / 4h）
@@ -1391,6 +1846,7 @@
     initChart();
     bindUi();
     syncChartTfBtns();
+    renderLayerBar();
     renderFeed();
     renderAll();
     const want = decodeURIComponent(location.hash.slice(1)).toUpperCase();
@@ -1447,6 +1903,7 @@
         renderOhlc();
         vol.update({ time: T, value: x.volume, color: x.close >= x.open ? "rgba(38,166,154,.35)" : "rgba(239,83,80,.35)" });
       }
+      renderSub(false);
     }, 1000);
   }
 

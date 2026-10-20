@@ -85,7 +85,8 @@ html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
 .chart-head .legend { flex: 1 1 auto; min-width: 0; overflow: hidden; }
 .chart-head .legend span { white-space: nowrap; }
 .chart-title { font-weight: 700; font-size: 14px; }
-.legend { display: flex; gap: 12px; font-size: 11px; color: var(--muted); }
+.legend { flex-shrink: 0; display: flex; gap: 4px 12px; font-size: 11px; color: var(--muted); flex-wrap: wrap; padding: 3px 12px; border-top: 1px solid var(--line); }
+.legend span { white-space: nowrap; }
 .legend i { display: inline-block; width: 10px; height: 3px; vertical-align: middle; margin-right: 3px; }
 .chart { flex: 1; min-height: 0; }
 .ohlc { display: flex; flex-wrap: wrap; gap: 4px 14px; padding: 4px 12px; font-size: 12px; border-bottom: 1px solid var(--line); min-height: 26px; align-items: center; }
@@ -143,6 +144,28 @@ html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
 .tf-line .long, .tf-line .short, .tf-line .wait { font-weight: 600; }
 .ctx-grid { display: grid; grid-template-columns: 1.4fr 1fr 1fr 1fr; gap: 3px 8px; font-size: 12px; }
 
+/* ---------- 周期分组 / 图层开关 / 3m 副图 ---------- */
+.tf-grp { font-size: 11px; color: var(--muted); margin: 0 2px 0 8px; }
+.tf-grp:first-child { margin-left: 0; }
+.layer-bar { flex-shrink: 0; display: flex; gap: 4px; padding: 4px 12px; border-bottom: 1px solid var(--line); overflow-x: auto; scrollbar-width: thin; align-items: center; }
+.layer-bar .chip { flex: 0 0 auto; font-size: 11px; padding: 1px 8px; border-radius: 10px; background: var(--bg); color: var(--muted); border: 1px solid var(--line); cursor: pointer; font-family: inherit; }
+.layer-bar .chip i { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; opacity: .35; }
+.layer-bar .chip.on { color: var(--text); border-color: #3b465c; background: var(--panel2); }
+.layer-bar .chip.on i { opacity: 1; }
+.layer-bar .sep { flex: 0 0 1px; height: 16px; background: var(--line); margin: 0 4px; }
+.layer-bar .preset { color: var(--accent); border-style: dashed; }
+.sub-wrap { flex: 0 0 34%; display: flex; flex-direction: column; border-top: 2px solid var(--line); min-height: 0; }
+.sub-wrap.off { display: none; }
+.sub-head { font-size: 11px; padding: 2px 12px; color: var(--muted); display: flex; gap: 10px; flex-wrap: wrap; }
+.sub-head b { color: var(--text); }
+.st-row { display: grid; grid-template-columns: 34px 1.25fr 1fr 0.9fr 0.8fr; gap: 4px; font-size: 12px; padding: 2px 4px; border-radius: 4px; align-items: baseline; }
+.st-row.head { color: var(--muted); font-size: 11px; }
+.st-row.cur { background: var(--panel2); font-weight: 600; }
+.st-row.dim { opacity: .6; }
+.st-detail { margin-top: 6px; font-size: 12px; line-height: 1.6; }
+.st-detail .row { display: grid; grid-template-columns: 62px 1fr; gap: 6px; }
+.resonance { margin: 6px 0 2px; font-size: 12px; padding: 4px 8px; border-radius: 4px; background: var(--panel2); }
+
 /* ---------- 推送设置弹窗 ---------- */
 .menu-btn { display: none; }
 .modal { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.6); z-index: 100; align-items: center; justify-content: center; padding: 12px; }
@@ -194,6 +217,7 @@ code { background: var(--bg); padding: 0 4px; border-radius: 3px; }
   .chart-head { padding: 4px 10px; }
   .chart-head .chart-title { font-size: 12px; }
   .chart-tf .tf-btn { padding: 1px 8px; font-size: 11px; }
+  .st-row { grid-template-columns: 30px 1.25fr 1fr 0.9fr 0.8fr; font-size: 11px; }
   .ohlc { gap: 8px; font-size: 11px; }
   .center { height: 70vh; }
 }
@@ -205,3 +229,11 @@ code { background: var(--bg); padding: 0 4px; border-radius: 3px; }
 .size-box { margin-top: 8px; padding: 6px 8px; background: var(--bg); border-radius: 6px; font-size: 12px; line-height: 1.7; }
 .size-box input { width: 56px; background: var(--panel2); border: 1px solid var(--line); color: var(--text); border-radius: 4px; padding: 1px 4px; font: inherit; }
 .copy-btn { margin-top: 8px; width: 100%; }
+
+/* 手机：主图和 3m 副图各给固定高度，不再互相挤（必须放在上面 .center 70vh 之后） */
+@media (max-width: 900px) {
+  .center { height: auto; min-height: 0; }
+  #chart { flex: none; height: 56vh; min-height: 320px; }
+  .sub-wrap { flex: none; height: 36vh; min-height: 220px; }
+  #chart3 { flex: 1; min-height: 0; }
+}
