@@ -12,11 +12,11 @@
   <link rel="icon" href="icon.svg" type="image/svg+xml" />
   <link rel="apple-touch-icon" href="icon.svg" />
   <title>盯盘助手 MTF · 多周期</title>
-  <link rel="stylesheet" href="css/style.css?v=8" />
+  <link rel="stylesheet" href="css/style.css?v=9" />
 </head>
 <body>
   <header class="topbar">
-    <div class="brand">盯盘助手 <span class="sub">短线 15m+3m · 长线 1h/4h/日线</span></div>
+    <div class="brand">盯盘助手 <span class="sub">短线 3m/15m · 长线 1h/4h/日线</span></div>
     <button id="menuBtn" class="btn menu-btn">⚙️ 设置</button>
     <div class="controls">
       <label title="共振分数达到该值才发出信号。越高信号越少，胜率越高">
@@ -45,7 +45,8 @@
         <div id="chartTitle" class="chart-title"></div>
         <div class="chart-tf" id="chartTf">
           <span class="tf-grp">短线</span>
-          <button class="btn tf-btn" data-ctf="15m" title="15 分钟主图 + 下方 3 分钟入场确认">15m+3m</button>
+          <button class="btn tf-btn" data-ctf="3m" title="3 分钟：在 15m 结构里找入场点（投影 15m/1h 位和 15m 趋势线）">3m</button>
+          <button class="btn tf-btn" data-ctf="15m">15m</button>
           <span class="tf-grp">长线</span>
           <button class="btn tf-btn" data-ctf="1h">1h</button>
           <button class="btn tf-btn" data-ctf="4h">4h</button>
@@ -55,10 +56,6 @@
       <div id="layerBar" class="layer-bar"></div>
       <div id="ohlc" class="ohlc num"></div>
       <div id="chart" class="chart"></div>
-      <div id="subWrap" class="sub-wrap">
-        <div id="subHead" class="sub-head"></div>
-        <div id="chart3" class="chart"></div>
-      </div>
       <div id="legend" class="legend"></div>
       <div id="indicatorBar" class="indicator-bar"></div>
     </section>
@@ -140,11 +137,11 @@
   </div>
 
   <script src="js/vendor/lightweight-charts.js"></script>
-  <script src="js/indicators.js?v=8"></script>
-  <script src="js/levels.js?v=8"></script>
-  <script src="js/structure.js?v=8"></script>
-  <script src="js/strategy.js?v=8"></script>
-  <script src="js/push.js?v=8"></script>
-  <script src="js/app.js?v=8"></script>
+  <script src="js/indicators.js?v=9"></script>
+  <script src="js/levels.js?v=9"></script>
+  <script src="js/structure.js?v=9"></script>
+  <script src="js/strategy.js?v=9"></script>
+  <script src="js/push.js?v=9"></script>
+  <script src="js/app.js?v=9"></script>
 </body>
 </html>

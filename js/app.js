@@ -59,7 +59,7 @@
     { id: "old", name: "策略价位", color: "rgba(239,83,80,.6)", tip: "旧版画法：策略止损用的 15m/1h ★价位 + 4h/日线紫色位" },
     { id: "reg", name: "回归通道", color: "rgba(0,217,255,.95)", tip: "旧版：log 收盘价回归通道 + 底部形态色带 + Donchian 震荡框" },
   ];
-  const LAYER_DEFAULT = { swing: 1, zone: 1, htf: 1, tl: 1, ch: 1, zs: 1, wave: 0, bos: 0, sig: 1, ma: 0, old: 0, reg: 0 };
+  const LAYER_DEFAULT = { swing: 0, zone: 1, htf: 1, tl: 1, ch: 0, zs: 1, wave: 0, bos: 0, sig: 1, ma: 0, old: 0, reg: 0 };
   const LAYER_PRESETS = {
     简洁: { zone: 1, htf: 1, tl: 1, sig: 1 },
     结构: { swing: 1, zone: 1, htf: 1, tl: 1, ch: 1, zs: 1, bos: 1, sig: 1 },
@@ -77,7 +77,7 @@
     feed: [],
     flashUntil: {}, // sym -> 时间戳，卡片闪烁
     chTf: store.load("chTf", "1d"), // 15m 图上「趋势通道」面板的周期档位："1d" 或 "4h"
-    chartTf: store.load("chartTf", "15m"), // 主图周期："15m"（短线，带 3m 副图）/ "1h" / "4h" / "1d"（长线）
+    chartTf: store.load("chartTf", "15m"), // 主图周期："3m" / "15m"（短线）/ "1h" / "4h" / "1d"（长线）
     layers: { ...LAYER_DEFAULT, ...store.load("layers", {}) }, // 图上各图层开关，见 LAYERS
   };
   state.active = state.symbols[0];
@@ -172,7 +172,7 @@
       // 4h/日线拉得比原版多：通道拟合窗口拉长到 4h 360 根 / 日线 120 根，还要留出余量
       fetchKlines(sym, LTF, 1500), fetchKlines(sym, HTF, 500), fetchKlines(sym, "4h", 1000), fetchKlines(sym, "1d", 500),
       // 3m 只用于短线副图（入场确认），不参与策略。失败不影响其它
-      fetchKlines(sym, "3m", 1000).catch(() => []),
+      fetchKlines(sym, "3m", 1000).catch(() => []), // 3m 只用于画图（短线入场），不参与策略
     ]);
     const prev = state.data[sym];
     state.data[sym] = {
@@ -483,7 +483,7 @@
       lastMsgAt = Date.now();
       const arr = { [LTF]: d.ltf, [HTF]: d.htf, "4h": d.h4, "1d": d.d1, "3m": d.m3 }[k.i];
       if (arr) upsertCandle(arr, c);
-      if (k.i === "3m") return; // 3m 只画副图，不触发策略重算
+      if (k.i === "3m") return; // 3m 只用于画图，不触发策略重算
       d.dirty = true;
       if (k.x) recompute(k.s); // K线收盘立刻计算信号
     };
@@ -509,13 +509,16 @@
   // 画出来就像"这个位一直存在"——对历史K线来说是假的。所以区、线、框都从它开始存在的那根K线画起。
   //
   // 图元（时间已经加过 TZ、并且对齐到图上存在的K线时间）：
-  //   rect  { t0,t1,lo,hi, fill, stroke, dash, frame, label, lc, la:"left"|"right" }
-  //   line  { t0,p0,t1,p1, color, width, dash, label, lc }      趋势线、通道、BOS 线
-  //   poly  { pts:[{time,price}], color, width, dashLast }        波段、波浪
-  //   band  { pts:[{time,up,dn}], fill }                          通道填充
-  //   text  { time, price, text, color, pos:"above"|"below", circle, size }
+  //   rect  { t0,t1,lo,hi, fill, fade, stroke, edge:"lo"|"hi"|"both"|"frame", dash, width, label, lc }
+  //   line  { t0,p0,t1,p1, color, width, dash, label, lc, la:"end"|"mid" }
+  //   poly  { pts:[{time,price}], color, width, dashLast }
+  //   band  { pts:[{time,up,dn}], fill }
+  //   text  { time, price, text, color, pos:"above"|"below", circle, size, off }
   //   vline { time, color, label }
-  // 两个实例：bottom 只画填充（在K线下面），top 画线和文字。
+  // 视觉规则：
+  //   * 区只描"朝向现价的那条边"（压力描下沿、支撑描上沿），另一边靠填充表达 —— 横线数量减半
+  //   * 区的填充从左到右渐浓（fade），越老的部分越淡，视线自然落到右侧现价附近
+  //   * 标签是右端的小胶囊，按优先级（prio 小的先放）摆放，和已放的重叠就不画，不再往下挤成一串
   class Overlay {
     constructor(z) { this._z = z; this._items = []; this._views = [this]; }
     attached(p) { this._chart = p.chart; this._series = p.series; this._req = p.requestUpdate; }
@@ -546,11 +549,21 @@
       const ok = (...v) => v.every((x) => x != null && isFinite(x));
       target.useBitmapCoordinateSpace(({ context: c, horizontalPixelRatio: hr, verticalPixelRatio: vr, bitmapSize }) => {
         c.save();
+        const W = bitmapSize.width;
         if (this._z === "bottom") {
           for (const it of g) {
             if (it.t === "rect" && it.fill && ok(it.x0, it.x1, it.y0, it.y1)) {
-              c.fillStyle = it.fill;
-              c.fillRect(it.x0 * hr, it.y0 * vr, (it.x1 - it.x0) * hr, Math.max(1, (it.y1 - it.y0) * vr));
+              const x0 = Math.max(0, it.x0 * hr), x1 = Math.min(W, it.x1 * hr);
+              if (x1 <= x0) continue;
+              if (it.fade) {
+                // 渐变：左端 15% 浓度 → 右端 100%
+                const m = it.fill.match(/rgba?\(([^)]+)\)/), parts = m ? m[1].split(",").map((x) => x.trim()) : null;
+                const a = parts?.[3] != null ? +parts[3] : 1, rgb = parts ? parts.slice(0, 3).join(",") : "128,128,128";
+                const gr = c.createLinearGradient(x0, 0, x1, 0);
+                gr.addColorStop(0, `rgba(${rgb},${a * 0.15})`); gr.addColorStop(1, `rgba(${rgb},${a})`);
+                c.fillStyle = gr;
+              } else c.fillStyle = it.fill;
+              c.fillRect(x0, it.y0 * vr, x1 - x0, Math.max(1, (it.y1 - it.y0) * vr));
             } else if (it.t === "band") {
               const p = it.xy.filter((q) => ok(...q));
               if (p.length < 2) continue;
@@ -564,44 +577,49 @@
           return;
         }
         const font = (sz, w = 600) => `${w} ${sz * vr}px -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif`;
-        const placed = []; // 已放置的标签矩形，后放的往下让，避免叠在一起
-        const label = (txt, x, y, color, align = "left", sz = 10.5) => {
+        const placed = [];
+        const hits = (r) => placed.some((q) => r.x < q.x + q.w && r.x + r.w > q.x && r.y < q.y + q.h && r.y + r.h > q.y);
+        // 胶囊标签：(x,y) 为锚点，align=right 时右端对齐锚点；垂直居中于 y。撞了就不画
+        const pill = (txt, x, y, color, align = "right", sz = 10, force = false) => {
           c.font = font(sz);
-          const tw = c.measureText(txt).width, h = (sz + 5) * vr, pad = 3 * hr;
-          let px = align === "right" ? x - tw - 2 * pad : x, py = y;
-          for (let guard = 0; guard < 6; guard++) {
-            const hit = placed.find((r) => px < r.x + r.w && px + tw + 2 * pad > r.x && py < r.y + r.h && py + h > r.y);
-            if (!hit) break;
-            py = hit.y + hit.h + 1;
-          }
-          placed.push({ x: px, y: py, w: tw + 2 * pad, h });
-          c.fillStyle = "rgba(14,17,23,.78)"; c.fillRect(px, py, tw + 2 * pad, h);
-          c.fillStyle = color; c.textBaseline = "middle"; c.fillText(txt, px + pad, py + h / 2);
+          const tw = c.measureText(txt).width, h = (sz + 6) * vr, pad = 4 * hr;
+          const r = { x: align === "right" ? x - tw - 2 * pad : x, y: y - h / 2, w: tw + 2 * pad, h };
+          r.x = Math.max(0, Math.min(W - r.w, r.x));
+          if (!force && hits(r)) return false;
+          placed.push(r);
+          c.fillStyle = "rgba(14,17,23,.85)";
+          c.beginPath(); c.roundRect ? c.roundRect(r.x, r.y, r.w, r.h, 3 * hr) : c.rect(r.x, r.y, r.w, r.h); c.fill();
+          c.setLineDash([]); c.lineWidth = 1 * hr; c.strokeStyle = color; c.globalAlpha = 0.55; c.stroke(); c.globalAlpha = 1;
+          c.fillStyle = color; c.textBaseline = "middle"; c.textAlign = "left"; c.fillText(txt, r.x + pad, r.y + h / 2 + 0.5 * vr);
+          return true;
         };
         const stroke = (color, width, dash) => {
           c.strokeStyle = color; c.lineWidth = Math.max(1, width * hr);
           c.setLineDash(dash ? (dash === 2 ? [2 * hr, 3 * hr] : [6 * hr, 4 * hr]) : []);
         };
-        const later = []; // 文字最后画，压在所有线上面
+        const hline = (x0, x1, y) => { c.beginPath(); c.moveTo(x0, Math.round(y) + 0.5); c.lineTo(x1, Math.round(y) + 0.5); c.stroke(); };
+        const labels = []; // [prio, fn]
         for (const it of g) {
           if (it.t === "rect") {
             if (!ok(it.x0, it.x1, it.y0, it.y1)) continue;
-            if (it.stroke) {
+            const x0 = it.x0 * hr, x1 = it.x1 * hr, y0 = it.y0 * vr, y1 = it.y1 * vr;
+            if (it.stroke && it.edge) {
               stroke(it.stroke, it.width ?? 1, it.dash);
-              if (it.frame) c.strokeRect(it.x0 * hr, it.y0 * vr, (it.x1 - it.x0) * hr, (it.y1 - it.y0) * vr);
-              else for (const y of [it.y0, it.y1]) { c.beginPath(); c.moveTo(it.x0 * hr, Math.round(y * vr) + 0.5); c.lineTo(it.x1 * hr, Math.round(y * vr) + 0.5); c.stroke(); }
+              if (it.edge === "frame") c.strokeRect(x0, y0, x1 - x0, y1 - y0);
+              if (it.edge === "hi" || it.edge === "both") hline(x0, x1, y0);
+              if (it.edge === "lo" || it.edge === "both") hline(x0, x1, y1);
             }
-            if (it.label) later.push(() => it.la === "left"
-              ? label(it.label, it.x0 * hr + 4 * hr, it.y0 * vr + 2 * vr, it.lc ?? it.stroke)
-              : label(it.label, it.x1 * hr - 4 * hr, it.y0 * vr + 2 * vr, it.lc ?? it.stroke, "right"));
+            if (it.label) {
+              const ly = it.la === "left" ? y0 + 9 * vr : it.edge === "lo" ? y1 : it.edge === "hi" ? y0 : (y0 + y1) / 2;
+              labels.push([it.prio ?? 5, () => pill(it.label, it.la === "left" ? x0 + 4 * hr : x1 - 3 * hr, ly, it.lc ?? it.stroke, it.la === "left" ? "left" : "right")]);
+            }
           } else if (it.t === "line") {
             if (!ok(it.x0, it.x1, it.y0, it.y1)) continue;
             stroke(it.color, it.width ?? 1, it.dash);
             c.beginPath(); c.moveTo(it.x0 * hr, it.y0 * vr); c.lineTo(it.x1 * hr, it.y1 * vr); c.stroke();
-            if (it.label) later.push(() => {
-              const lx = it.la === "mid" ? (it.x0 + it.x1) / 2 : it.x1, ly = it.la === "mid" ? (it.y0 + it.y1) / 2 : it.y1;
-              label(it.label, lx * hr + (it.la === "mid" ? -10 * hr : -4 * hr), ly * vr - 17 * vr, it.lc ?? it.color, it.la === "mid" ? "left" : "right", 10);
-            });
+            if (it.label) labels.push([it.prio ?? 4, () => it.la === "mid"
+              ? pill(it.label, (it.x0 + it.x1) / 2 * hr, (it.y0 + it.y1) / 2 * vr - 10 * vr, it.lc ?? it.color, "left", 9)
+              : pill(it.label, it.x1 * hr - 3 * hr, it.y1 * vr - 11 * vr, it.lc ?? it.color, "right", 9.5)]);
           } else if (it.t === "poly") {
             const p = it.xy;
             for (let i = 1; i < p.length; i++) {
@@ -611,35 +629,37 @@
             }
           } else if (it.t === "text") {
             if (!ok(it.x, it.y)) continue;
-            later.push(() => {
+            labels.push([it.prio ?? 6, () => {
               const sz = it.size ?? 10, off = (it.off ?? 8) * vr;
               c.font = font(sz, it.circle ? 700 : 600);
               const tw = c.measureText(it.text).width, x = it.x * hr;
               const y = it.pos === "below" ? it.y * vr + off + sz * vr / 2 : it.y * vr - off - sz * vr / 2;
+              const r = { x: x - tw / 2 - 2 * hr, y: y - sz * vr / 2 - 1, w: tw + 4 * hr, h: sz * vr + 2 };
+              if (!it.circle && hits(r)) return;
+              placed.push(r);
               c.textBaseline = "middle"; c.textAlign = "center";
               if (it.circle) {
-                const r = Math.max(tw / 2 + 3 * hr, (sz / 2 + 3) * vr);
-                c.beginPath(); c.arc(x, y, r, 0, Math.PI * 2); c.fillStyle = "rgba(14,17,23,.9)"; c.fill();
+                const rad = Math.max(tw / 2 + 3 * hr, (sz / 2 + 3) * vr);
+                c.beginPath(); c.arc(x, y, rad, 0, Math.PI * 2); c.fillStyle = "rgba(14,17,23,.92)"; c.fill();
                 c.setLineDash([]); c.lineWidth = 1.2 * hr; c.strokeStyle = it.color; c.stroke();
               }
               c.fillStyle = it.color; c.fillText(it.text, x, y + 0.5 * vr);
               c.textAlign = "left";
-            });
+            }]);
           } else if (it.t === "vline") {
             if (!ok(it.x)) continue;
             stroke(it.color, 1, 1);
             c.beginPath(); c.moveTo(it.x * hr, 0); c.lineTo(it.x * hr, bitmapSize.height); c.stroke();
-            if (it.label) later.push(() => label(it.label, it.x * hr + 4 * hr, 4 * vr, it.color));
+            if (it.label) labels.push([3, () => pill(it.label, it.x * hr + 4 * hr, 12 * vr, it.color, "left")]);
           }
         }
         c.setLineDash([]);
-        later.forEach((f) => f());
+        labels.sort((a, b) => a[0] - b[0]).forEach(([, f]) => f());
         c.restore();
       });
     }
   }
   const fillLayer = new Overlay("bottom"), lineLayer = new Overlay("normal");
-  const fillLayer3 = new Overlay("bottom"), lineLayer3 = new Overlay("normal");
 
   // ── 价格结构（structure.js）：每个周期一份，只用已收盘K线，按最后一根收盘时间缓存 ──
   const TFS = {
@@ -686,14 +706,12 @@
   }
 
   // 图层图元生成。k = 图上的K线（含正在形成的），sec = 图的周期
+  // 配色：本周期 红压/绿撑；大周期 紫（近一级）/粉（远一级）；中枢 橙；通道 蓝；波浪 青。
+  const rgba = (rgb, a) => `rgba(${rgb},${a})`;
   const COL = {
-    res: { fill: "rgba(239,83,80,.13)", stroke: "rgba(239,83,80,.8)" },
-    sup: { fill: "rgba(38,166,154,.13)", stroke: "rgba(38,166,154,.8)" },
-    mid: { fill: "rgba(245,197,66,.12)", stroke: "rgba(245,197,66,.8)" },
-    htf: [{ fill: "rgba(188,148,255,.10)", stroke: "rgba(188,148,255,.85)" }, { fill: "rgba(255,120,200,.08)", stroke: "rgba(255,120,200,.75)" }],
-    zs: { fill: "rgba(255,170,40,.09)", stroke: "rgba(255,170,40,.9)" },
-    up: "#26a69a", dn: "#ef5350", broken: "rgba(150,160,180,.7)", ch: "rgba(76,141,255,.85)", chFill: "rgba(76,141,255,.06)",
-    swing: "rgba(210,215,230,.55)", wave: "#00d9ff", bos: "#f5c542",
+    res: "239,83,80", sup: "38,166,154", mid: "245,197,66", htf: ["188,148,255", "255,128,200"], zs: "255,170,40",
+    up: "#26a69a", dn: "#ef5350", broken: "rgba(140,150,170,.55)", ch: "rgba(96,156,255,.8)", chFill: "rgba(96,156,255,.05)",
+    swing: "rgba(200,206,220,.32)", wave: "#00d9ff", bos: "#f5c542",
   };
   function chartFrame(k, sec) {
     const T = (t) => t + TZ;
@@ -712,111 +730,106 @@
     return { t: "line", t0: F.T(a), p0: Structure.lineAt(L, a), t1: F.T(tb), p1: Structure.lineAt(L, tb), ...extra };
   }
   const fmtTouch = (z) => `×${z.touches}${z.flip ? "⇅" : ""}`;
+  // 区的浓度跟强度走：触碰越多、和大周期重叠，越浓
+  const zoneAlpha = (z, conf) => Math.min(0.26, 0.09 + 0.04 * Math.min(z.touches, 4) + (conf ? 0.05 : 0));
 
   function structItems(S, k, sec, Ly, o = {}) {
     const items = [], tags = [];
     if (!S || !k.length) return { items, tags };
     const F = chartFrame(k, sec), { T, snap, futEnd } = F;
     const inChart = (t) => t >= F.t0;
-    // 波段
+    // 波段：细淡线，只标最近 10 个点的 HH/HL/LH/LL（撞到别的标签就不标）
     if (Ly.swing) {
       const sw = S.swings.filter((s) => inChart(s.time));
       const pts = sw.map((s) => ({ time: T(s.time), price: s.price }));
       if (S.tentative && inChart(S.tentative.time)) pts.push({ time: T(S.tentative.time), price: S.tentative.price });
-      items.push({ t: "poly", pts, color: COL.swing, width: 1.2, dashLast: !!S.tentative });
-      for (const s of sw.slice(-16)) {
+      items.push({ t: "poly", pts, color: COL.swing, width: 1, dashLast: !!S.tentative });
+      for (const s of sw.slice(-10)) {
         const good = s.lab === "HH" || s.lab === "HL";
-        items.push({ t: "text", time: T(s.time), price: s.price, text: s.lab, pos: s.type === "H" ? "above" : "below", color: good ? "rgba(38,166,154,.95)" : "rgba(239,83,80,.95)", size: 9.5, off: 6 });
+        items.push({ t: "text", time: T(s.time), price: s.price, text: s.lab, pos: s.type === "H" ? "above" : "below", color: good ? "rgba(38,166,154,.8)" : "rgba(239,83,80,.8)", size: 9, off: 5, prio: 8 });
       }
     }
-    // BOS / CHoCH：从被突破的那个摆动点画到突破K线
+    // BOS / CHoCH：从被突破的那个摆动点画到突破K线，点线
     if (Ly.bos) {
-      for (const e of S.events.filter((x) => inChart(x.from.time)).slice(-5)) {
-        const color = e.kind === "CHoCH" ? COL.bos : e.dir > 0 ? "rgba(38,166,154,.8)" : "rgba(239,83,80,.8)";
-        items.push({ t: "line", t0: T(e.from.time), p0: e.price, t1: T(e.time), p1: e.price, color, width: 1, dash: 2, label: `${e.kind}${e.dir > 0 ? "↑" : "↓"}`, la: "mid", lc: color });
+      for (const e of S.events.filter((x) => inChart(x.from.time)).slice(-4)) {
+        const color = e.kind === "CHoCH" ? COL.bos : e.dir > 0 ? "rgba(38,166,154,.75)" : "rgba(239,83,80,.75)";
+        items.push({ t: "line", t0: T(e.from.time), p0: e.price, t1: T(e.time), p1: e.price, color, width: 1, dash: 2, label: e.kind, la: "mid", lc: color, prio: 6 });
       }
     }
-    // 中枢：最近 3 个，当前（还在延伸的）中枢画到右边
+    // 中枢：最近 2 个。当前（或最后一个）实线框，前一个淡虚线不带标签
     if (Ly.zs) {
-      // 只画最近 2 个：最后一个实线带标签，前一个淡色虚线不带标签
       const list = S.zs.filter((z) => z.t1 >= F.t0).slice(-2);
       list.forEach((z, idx) => {
         const active = z === S.activeZs, lastOne = idx === list.length - 1;
         items.push({
           t: "rect", t0: T(snap(z.t0)), t1: T(active ? futEnd : snap(z.t1)), lo: z.zd, hi: z.zg,
-          fill: lastOne ? COL.zs.fill : "rgba(255,170,40,.04)", stroke: lastOne ? COL.zs.stroke : "rgba(255,170,40,.45)",
-          width: active ? 1.5 : 1, dash: active ? 0 : 1, frame: true,
-          label: lastOne ? `${active ? "当前" : ""}中枢 ${z.n}笔` : "", la: "left",
+          fill: rgba(COL.zs, lastOne ? 0.07 : 0.035), stroke: rgba(COL.zs, lastOne ? 0.85 : 0.35), edge: "frame",
+          width: 1, dash: active ? 0 : 1, label: lastOne ? `中枢 ${z.n}笔` : "", la: "left", prio: 3,
         });
       });
     }
-    // 支撑压力区
+    // 支撑压力区：只描朝向现价的那条边，填充左淡右浓；标签在右端
     if (Ly.zone) {
       const z = S.zones;
-      // 价格挂在价格轴上，图里的标签只写性质；和大周期区重叠的标 "+1h" 等（多周期共振位）
-      const draw = (x, c, nm) => {
+      const draw = (x, rgb, nm, edge) => {
         const cf = [...new Set((o.htfZones ?? []).filter((h) => h.lo <= x.hi && h.hi >= x.lo).map((h) => h.tf))].map((t) => "+" + TFS[t].label).join("");
-        items.push({ t: "rect", t0: T(snap(x.from)), t1: T(futEnd), lo: x.lo, hi: x.hi, fill: c.fill, stroke: c.stroke, width: x.touches >= 3 || cf ? 1.8 : 1,
-          label: `${nm}${fmtTouch(x)}${cf}`, la: "right" });
-        tags.push([x.price, c.stroke, `${nm}${cf}`]);
+        const strong = x.touches >= 3 || !!cf;
+        items.push({ t: "rect", t0: T(snap(x.from)), t1: T(futEnd), lo: x.lo, hi: x.hi, fill: rgba(rgb, zoneAlpha(x, cf)), fade: true,
+          stroke: rgba(rgb, strong ? 0.95 : 0.7), edge, width: strong ? 1.6 : 1, dash: edge === "both" ? 1 : 0,
+          label: `${nm} ${fmtTouch(x)}${cf}`, lc: rgba(rgb, 1), prio: 1 });
+        tags.push([x.price, rgba(rgb, 0.95)]);
       };
-      z.above.forEach((x) => draw(x, COL.res, "压"));
-      z.below.forEach((x) => draw(x, COL.sup, "撑"));
-      if (z.inside) draw(z.inside, COL.mid, "区内");
+      z.above.forEach((x) => draw(x, COL.res, "压", "lo"));
+      z.below.forEach((x) => draw(x, COL.sup, "撑", "hi"));
+      if (z.inside) draw(z.inside, COL.mid, "区内", "both");
     }
     // 趋势线 + 通道
     if (Ly.tl || Ly.ch) {
       const tl = S.tl;
       const tlLine = (L, color) => slopeLine(F, L, L.a.time, futEnd, {
-        color, width: L.strong ? 2 : 1.3, dash: L.strong ? 0 : 1,
-        label: o.narrow ? `${L.touches}触` : `${L.side === "up" ? "上升线" : "下降线"} ${L.touches}触`, lc: color,
+        color, width: L.strong ? 2 : 1.3, dash: L.strong ? 0 : 1, label: `${L.touches}触`, lc: color, prio: 2,
       });
       if (Ly.tl) {
         if (tl.up) items.push(tlLine(tl.up, COL.up));
         if (tl.down) items.push(tlLine(tl.down, COL.dn));
         for (const B of [tl.upBroken, tl.downBroken]) if (B) {
-          items.push(slopeLine(F, B, B.a.time, B.breakTime, { color: COL.broken, width: 1.2, dash: 1 }));
-          items.push({ t: "text", time: T(snap(B.breakTime)), price: Structure.lineAt(B, B.breakTime), text: "破", pos: B.side === "up" ? "below" : "above", color: COL.broken, size: 10 });
+          items.push(slopeLine(F, B, B.a.time, B.breakTime, { color: COL.broken, width: 1, dash: 1 }));
+          items.push({ t: "text", time: T(snap(B.breakTime)), price: Structure.lineAt(B, B.breakTime), text: "破", pos: B.side === "up" ? "below" : "above", color: "rgba(170,180,200,.9)", size: 9.5, prio: 5 });
         }
       }
       const ch = S.channel;
       if (Ly.ch && ch) {
         if (ch.base) {
           const P = { t0: ch.base.t0, p0: ch.base.p0 + ch.offset, slope: ch.base.slope };
-          items.push(slopeLine(F, P, ch.base.a.time, futEnd, { color: COL.ch, width: 1.3, dash: 1, label: o.narrow ? "" : `${ch.kind} ${Math.round(ch.pos * 100)}%`, lc: COL.ch }));
+          items.push(slopeLine(F, P, ch.base.a.time, futEnd, { color: COL.ch, width: 1.2, dash: 1, label: `${ch.kind.replace("通道", "")}通道 ${Math.round(ch.pos * 100)}%`, lc: COL.ch, prio: 3 }));
           if (!Ly.tl) items.push(tlLine(ch.base, COL.ch));
           const ts = k.filter((x) => x.time >= ch.base.a.time).map((x) => x.time).concat([futEnd]);
           items.push({ t: "band", fill: COL.chFill, pts: ts.map((t) => { const b = Structure.lineAt(ch.base, t); return { time: T(t), up: Math.max(b, b + ch.offset), dn: Math.min(b, b + ch.offset) }; }) });
         } else if (ch.up && ch.dn) {
           const t0 = Math.max(ch.up.a.time, ch.dn.a.time);
           const ts = k.filter((x) => x.time >= t0).map((x) => x.time).concat([futEnd]);
-          items.push({ t: "band", fill: "rgba(245,197,66,.06)", pts: ts.map((t) => ({ time: T(t), up: Structure.lineAt(ch.dn, t), dn: Structure.lineAt(ch.up, t) })) });
+          items.push({ t: "band", fill: "rgba(245,197,66,.05)", pts: ts.map((t) => ({ time: T(t), up: Structure.lineAt(ch.dn, t), dn: Structure.lineAt(ch.up, t) })) });
           if (!Ly.tl) { items.push(tlLine(ch.up, COL.up)); items.push(tlLine(ch.dn, COL.dn)); }
-          items.push({ t: "text", time: T(snap(t0)), price: Structure.lineAt(ch.dn, t0), text: ch.kind, pos: "above", color: "#f5c542", size: 10.5 });
+          items.push({ t: "text", time: T(snap(t0)), price: Structure.lineAt(ch.dn, t0), text: ch.kind, pos: "above", color: "#f5c542", size: 10, prio: 3 });
         }
       }
     }
     // 波浪
     if (Ly.wave && S.wave) {
       const w = S.wave, pts = w.pts.filter((p) => inChart(p.time));
-      items.push({ t: "poly", pts: pts.map((p) => ({ time: T(p.time), price: p.price })), color: COL.wave, width: 1.6, dashLast: !!w.pts[w.pts.length - 1].tentative });
+      items.push({ t: "poly", pts: pts.map((p) => ({ time: T(p.time), price: p.price })), color: "rgba(0,217,255,.75)", width: 1.6, dashLast: !!w.pts[w.pts.length - 1].tentative });
       w.pts.forEach((p, i) => {
         if (!inChart(p.time)) return;
         const isHigh = i > 0 ? p.price > w.pts[i - 1].price : p.price > w.pts[1].price;
-        items.push({ t: "text", time: T(p.time), price: p.price, text: w.labels[i], pos: isHigh ? "above" : "below", color: COL.wave, circle: true, size: 10, off: o.swingOn ? 18 : 9 });
+        items.push({ t: "text", time: T(p.time), price: p.price, text: w.labels[i], pos: isHigh ? "above" : "below", color: COL.wave, circle: true, size: 10, off: o.swingOn ? 17 : 9, prio: 0 });
       });
-      if (w.next?.target) {
-        const last = w.pts[w.pts.length - 1];
-        items.push({ t: "line", t0: T(snap(last.time)), p0: w.next.target, t1: T(futEnd), p1: w.next.target, color: COL.wave, width: 1, dash: 2, label: `${w.next.txt.replace(/^可能/, "")} 参考 ${fmtPrice(w.next.target)}`, lc: COL.wave });
-      }
-      if (w.next?.limit) {
-        const last = w.pts[w.pts.length - 1];
-        items.push({ t: "line", t0: T(snap(last.time)), p0: w.next.limit, t1: T(futEnd), p1: w.next.limit, color: "rgba(0,217,255,.5)", width: 1, dash: 1, label: w.next.limitTxt, lc: "rgba(0,217,255,.7)" });
-      }
+      const last = w.pts[w.pts.length - 1];
+      if (w.next?.target) items.push({ t: "line", t0: T(snap(last.time)), p0: w.next.target, t1: T(futEnd), p1: w.next.target, color: "rgba(0,217,255,.7)", width: 1, dash: 2, label: `目标 ${fmtPrice(w.next.target)}`, lc: COL.wave, prio: 2 });
+      if (w.next?.limit) items.push({ t: "line", t0: T(snap(last.time)), p0: w.next.limit, t1: T(futEnd), p1: w.next.limit, color: "rgba(0,217,255,.4)", width: 1, dash: 1, label: "失效", lc: "rgba(0,217,255,.75)", prio: 2 });
     }
     return { items, tags };
   }
-  // 大周期支撑压力区投影到本图：横贯整张图的半透明色带
+  // 大周期支撑压力区投影到本图：淡色渐变带 + 朝向现价的一条虚线边
   function htfItems(list, k, sec, o = {}) {
     const items = [], tags = [];
     if (!k.length) return { items, tags };
@@ -827,20 +840,21 @@
     const overlaps = (z) => taken.some((t) => t.lo <= z.hi && t.hi >= z.lo);
     list.forEach(({ S, tf }, rank) => {
       if (!S) return;
-      const c = COL.htf[rank] ?? COL.htf[1], nm = TFS[tf].label;
+      const rgb = COL.htf[rank] ?? COL.htf[1], nm = TFS[tf].label;
       const draw = (z, isRes) => {
-        items.push({ t: "rect", t0: F.T(F.snap(z.from)), t1: F.T(F.futEnd), lo: z.lo, hi: z.hi, fill: c.fill, stroke: c.stroke, dash: 1,
-          label: `${nm}${isRes ? "压" : "撑"}${fmtTouch(z)}`, la: "right" });
-        tags.push([z.price, c.stroke, `${nm}${isRes ? "压" : "撑"}`]);
+        items.push({ t: "rect", t0: F.T(F.snap(z.from)), t1: F.T(F.futEnd), lo: z.lo, hi: z.hi, fill: rgba(rgb, 0.1), fade: true,
+          stroke: rgba(rgb, 0.8), edge: isRes ? "lo" : "hi", dash: 1, width: 1.2,
+          label: `${nm}${isRes ? "压" : "撑"} ${fmtTouch(z)}`, lc: rgba(rgb, 1), prio: 2 + rank });
+        tags.push([z.price, rgba(rgb, 0.9)]);
         taken.push(z);
       };
       for (const [arr, isRes] of [[S.zones.above, true], [S.zones.below, false]]) {
         const z = arr.find((x) => !overlaps(x));
         if (z) draw(z, isRes);
       }
-      // 3m 副图上额外投影 15m 的趋势线（3m 就是在 15m 结构里找入场点）
-      if (o.withTl && rank === 0) for (const L of [S.tl.up, S.tl.down]) if (L && L.a.time >= k[0].time - 50 * S.barSec) {
-        items.push(slopeLine(F, L, L.a.time, F.futEnd, { color: c.stroke, width: 1.5, dash: L.strong ? 0 : 1, label: `${nm}趋势线`, lc: c.stroke }));
+      // 3m 图上额外投影 15m 的趋势线（3m 就是在 15m 结构里找入场点）
+      if (o.withTl && rank === 0) for (const L of [S.tl.up, S.tl.down]) if (L) {
+        items.push(slopeLine(F, L, L.a.time, F.futEnd, { color: rgba(rgb, 0.85), width: 1.5, dash: L.strong ? 0 : 1, label: `${nm}线`, lc: rgba(rgb, 1), prio: 3 }));
       }
     });
     return { items, tags };
@@ -886,7 +900,6 @@
     return out;
   }
   let chart, candle, vol, ema9S, ema21S, stUpS, stDnS, priceLines = [];
-  let chart3, candle3, fut3, priceLines3 = [], sub3Key = "", sub3Sym = null;
   // 回归通道：当前通道（中轴 + 上下轨）+ 当时实际的通道轨迹（上下轨）+ 底部形态色带
   let chMidS, chUpS, chDnS, trUpS, trDnS, regimeS, futS;
   function initChart() {
@@ -932,23 +945,6 @@
     trDnS = chart.addLineSeries({ ...chOpt, color: "rgba(150,170,190,.55)", lineWidth: 1, lineStyle: 1 });
     // 只用来把时间轴往右撑出 FWD 根空白（通道外推、区间框延伸都画在这里）
     futS = chart.addLineSeries({ ...chOpt, visible: false });
-
-    // 3m 副图：短线模式下 15m 主图下方的入场确认图
-    chart3 = LightweightCharts.createChart($("chart3"), {
-      layout: { background: { color: "#0e1117" }, textColor: "#9aa3b5" },
-      grid: { vertLines: { color: "#161b24" }, horzLines: { color: "#161b24" } },
-      crosshair: { mode: 0 },
-      rightPriceScale: { borderColor: "#262d3b", minimumWidth: 72 },
-      timeScale: { borderColor: "#262d3b", timeVisible: true, secondsVisible: false, rightOffset: 8 },
-      autoSize: true,
-    });
-    candle3 = chart3.addCandlestickSeries({ upColor: "#26a69a", downColor: "#ef5350", borderVisible: false, wickUpColor: "#26a69a", wickDownColor: "#ef5350" });
-    candle3.priceScale().applyOptions({ scaleMargins: { top: 0.08, bottom: 0.06 } });
-    candle3.attachPrimitive(fillLayer3);
-    candle3.attachPrimitive(lineLayer3);
-    fut3 = chart3.addLineSeries({ ...chOpt, visible: false });
-    // 两张图价格轴等宽，主图和副图的K线才上下对齐
-    chart.applyOptions({ rightPriceScale: { minimumWidth: 72 } });
   }
 
   // 15m 主图时「趋势通道」面板可以独立选的周期
@@ -961,6 +957,7 @@
 
   // 主图可切换的周期（通道/区间的参数统一在 STRUCT 里）
   const CHART_TF = {
+    "3m": { label: "3m", key: "m3", sec: 180, bars: 200 },
     "15m": { label: "15m", key: "ltf", sec: LTF_SEC, bars: 160 },
     "1h": { label: "1h", key: "htf", sec: 3600, bars: 240 },
     "4h": { label: "4h", key: "h4", sec: 4 * 3600, bars: 240 },
@@ -1079,7 +1076,7 @@
       text: `${s.side > 0 ? "多" : "空"}${s.score}`,
     }));
     if (sigOn && d.exit) markers.push({ time: T(d.exit.time), position: d.exit.side > 0 ? "aboveBar" : "belowBar", color: "#f5a623", shape: "circle", text: "弱" });
-    if (sigOn) for (const ev of d.rejections ?? []) markers.push({
+    if (sigOn) for (const ev of (d.rejections ?? []).filter((e) => e.first)) markers.push({
       time: T(ev.time), position: ev.isRes ? "aboveBar" : "belowBar", color: "#f5a623",
       shape: "square", size: ev.first ? 1 : 0.6, text: ev.first ? "🧱" : "",
     });
@@ -1105,11 +1102,16 @@
     const ownZ = S && Ly.zone ? [...S.zones.above, ...S.zones.below, ...(S.zones.inside ? [S.zones.inside] : [])] : [];
     const htfZ = htfList.flatMap(({ tf, S: H }) => (H ? [...H.zones.above.slice(0, 2), ...H.zones.below.slice(0, 2)].map((z) => ({ ...z, tf })) : []));
     const own = structItems(S, k, ctf.sec, Ly, { narrow: narrowUi, swingOn: !!Ly.swing, htfZones: htfZ });
-    const hi = Ly.htf ? htfItems(htfList, k, ctf.sec, { own: ownZ }) : { items: [], tags: [] };
+    const hi = Ly.htf ? htfItems(htfList, k, ctf.sec, { own: ownZ, withTl: state.chartTf === "3m" && !!Ly.tl }) : { items: [], tags: [] };
     // 大周期色带先画（在下面），本周期的线压在上面
     items.push(...hi.items, ...own.items);
     // 价格轴标签：太多会叠成一团，离现价 8 ATR 以外的不挂
-    for (const [p, c, t] of [...own.tags, ...hi.tags]) if (Math.abs(p - pxNow) <= 8 * atrNow) axisTag(p, c, narrowUi ? t.replace(/×.*/, "") : t);
+    // 价格轴只挂价格（性质已经写在图里的胶囊上），相距 < 0.3 ATR 的只挂一个，离现价 8 ATR 以外不挂
+    const tagged = [];
+    for (const [p, c] of [...own.tags, ...hi.tags]) {
+      if (Math.abs(p - pxNow) > 8 * atrNow || tagged.some((q) => Math.abs(q - p) < 0.3 * atrNow)) continue;
+      tagged.push(p); axisTag(p, c, "");
+    }
 
     // ── 旧版画法（策略价位 / 回归通道），默认关闭 ─────────────────────────────
     if (Ly.old) {
@@ -1204,56 +1206,9 @@
     }
     chartKey = chartKeyOf(d);
     renderOhlc();
-    renderSub(true);
   }
 
-  // ── 3m 副图（短线模式）：3m 自己的结构 + 15m 的支撑压力区和趋势线投影 ──────────
-  const isShort = () => state.chartTf === "15m";
-  function renderSub(force) {
-    const wrap = $("subWrap");
-    if (!isShort()) { wrap.classList.add("off"); return; }
-    wrap.classList.remove("off");
-    const sym = state.active, d = state.data[sym];
-    const k = d?.m3 ?? [];
-    if (!k.length) { setHtml("subHead", '<span>3m 数据加载中…</span>'); return; }
-    const T = (t) => t + TZ, Ly = state.layers;
-    const key = `${sym}|${k.length}|${k[k.length - 1].time}|${JSON.stringify(Ly)}`;
-    if (!force && key === sub3Key) {
-      const x = k[k.length - 1];
-      candle3.update({ time: T(x.time), open: x.open, high: x.high, low: x.low, close: x.close });
-      return;
-    }
-    sub3Key = key;
-    const prec = decimals(k[k.length - 1].close);
-    candle3.applyOptions({ priceFormat: { type: "price", precision: prec, minMove: 10 ** -prec } });
-    candle3.setData(k.map((x) => ({ time: T(x.time), open: x.open, high: x.high, low: x.low, close: x.close })));
-    const lastT = k[k.length - 1].time;
-    fut3.setData(Array.from({ length: FWD }, (_, i) => ({ time: T(lastT + (i + 1) * 180) })));
-    const S3 = structOf(sym, "3m"), S15 = structOf(sym, "15m");
-    const narrow = matchMedia("(max-width: 900px)").matches;
-    // 副图上不画通道/波浪（3m 上这两样噪声太大），其余跟主图开关一致
-    const own3Z = S3 && Ly.zone ? [...S3.zones.above, ...S3.zones.below] : [];
-    const z15 = Ly.htf && S15 ? [...S15.zones.above.slice(0, 2), ...S15.zones.below.slice(0, 2)].map((z) => ({ ...z, tf: "15m" })) : [];
-    const own = structItems(S3, k, 180, { ...Ly, ch: 0, wave: 0 }, { narrow: true, swingOn: !!Ly.swing, htfZones: z15 });
-    const hi = Ly.htf ? htfItems([{ tf: "15m", S: S15 }], k, 180, { withTl: !!Ly.tl, own: own3Z }) : { items: [], tags: [] };
-    const items = [...hi.items, ...own.items];
-    fillLayer3.set(items);
-    lineLayer3.set(items);
-    priceLines3.forEach((pl) => candle3.removePriceLine(pl));
-    priceLines3 = [];
-    const atr = S3?.atrNow ?? 0, px = k[k.length - 1].close;
-    for (const [p, c, t] of [...own.tags, ...hi.tags]) if (!atr || Math.abs(p - px) <= 10 * atr)
-      priceLines3.push(candle3.createPriceLine({ price: p, color: c, title: t.replace(/×.*/, ""), lineVisible: false, axisLabelVisible: true }));
-    if (sub3Sym !== sym) {
-      const bars = Math.min(k.length, narrow ? 80 : 160);
-      chart3.timeScale().setVisibleLogicalRange({ from: k.length - bars, to: k.length + 8 });
-      sub3Sym = sym;
-    }
-    const cf = confirm3(S15, S3, k);
-    setHtml("subHead", `<span><b>3m 入场确认</b></span><span>${S3 ? biasHtml(S3) : "-"}</span>` +
-      (S3?.lastEv ? `<span>最近 ${evTxt(S3.lastEv)}</span>` : "") +
-      (cf ? `<span class="${cf.cls}">${cf.txt}</span>` : ""));
-  }
+  const isShort = () => state.chartTf === "15m" || state.chartTf === "3m";
 
   // 结构文字
   const biasHtml = (S) => `<b class="${S.bias > 0 ? "long" : S.bias < 0 ? "short" : "wait"}">${S.biasTxt}</b>`;
@@ -1362,14 +1317,14 @@
     const Ly = state.layers, htfs = (HTF_OF[state.chartTf] ?? []).map((t) => TFS[t].label).join("/");
     const lgParts = [];
     if (Ly.zone) lgParts.push(lg("rgba(239,83,80,.8)", "压力区") + lg("rgba(38,166,154,.8)", "支撑区"));
-    if (Ly.htf && htfs) lgParts.push(lg(COL.htf[0].stroke, `${htfs} 大周期区`));
+    if (Ly.htf && htfs) lgParts.push(lg(rgba(COL.htf[0], .9), `${htfs} 大周期区`));
     if (Ly.tl) lgParts.push('<span class="muted">趋势线：实线≥3触 虚线=候选 灰=已破</span>');
-    if (Ly.zs) lgParts.push(lg(COL.zs.stroke, "中枢 ZD~ZG"));
+    if (Ly.zs) lgParts.push(lg(rgba(COL.zs, .9), "中枢 ZD~ZG"));
     if (Ly.ma) lgParts.push(lg("#f5c542", "EMA9") + lg("#4c8dff", "EMA21"));
     if (Ly.sig && state.chartTf === "15m") lgParts.push('<span class="muted">▲▼ 信号 · ● 转弱 · 🧱 强价位被拒</span>');
     lgParts.push('<span class="muted legend-note">结构图层只用已收盘K线 · 阈值未经收益回测，只做显示</span>');
     setHtml("legend", lgParts.join(""));
-    $("chartTitle").innerHTML = `${short(sym)} <span class="muted small">${CN_NAMES[sym] ?? ""} · ${MARKET_NAMES[marketOf(sym)]}永续 · ${state.chartTf === "15m" ? "短线 15m+3m" : "长线 " + (CHART_TF[state.chartTf] ?? CHART_TF["15m"]).label}${sess ? " · " + sess.txt : ""}</span>`;
+    $("chartTitle").innerHTML = `${short(sym)} <span class="muted small">${CN_NAMES[sym] ?? ""} · ${MARKET_NAMES[marketOf(sym)]}永续 · ${isShort() ? "短线 " : "长线 "}${(CHART_TF[state.chartTf] ?? CHART_TF["15m"]).label}${sess ? " · " + sess.txt : ""}</span>`;
     renderStructPanel();
     if (!d?.live) { setHtml("liveScore", `<span class="muted">${d?.error ?? "加载中…"}</span>`); return; }
     const L = d.live, p = d.res.params;
@@ -1608,7 +1563,7 @@
     let html = `<div class="st-row head"><span>周期</span><span>结构</span><span>最近突破</span><span>中枢</span><span>波浪</span></div>`;
     for (const tf of order) {
       const S = St[tf];
-      html += `<div class="st-row ${tf === main || (isS && tf === "3m") ? "cur" : group.includes(tf) ? "" : "dim"}"><span>${TFS[tf].label}</span>` +
+      html += `<div class="st-row ${tf === main ? "cur" : group.includes(tf) ? "" : "dim"}"><span>${TFS[tf].label}</span>` +
         (S ? `<span>${biasHtml(S)}</span><span>${S.lastEv ? evTxt(S.lastEv, S.barSec) : '<span class="muted">-</span>'}</span><span>${zsTxt(S)}</span><span>${wvTxt(S)}</span>`
           : '<span class="muted">数据不足</span><span></span><span></span><span></span>') + "</div>";
     }
@@ -1665,7 +1620,7 @@
   function layersChanged() {
     store.save("layers", state.layers);
     renderLayerBar();
-    chartKey = ""; sub3Key = "";
+    chartKey = "";
     htmlCache.legend = null;
     renderSide();
     renderChart();
@@ -1708,7 +1663,7 @@
       store.save("chartTf", state.chartTf);
       syncChartTfBtns();
       htmlCache.chartTitle = null;
-      chartKey = ""; sub3Key = "";
+      chartKey = "";
       renderSide();
       renderChart();
     });
@@ -1903,7 +1858,6 @@
         renderOhlc();
         vol.update({ time: T, value: x.volume, color: x.close >= x.open ? "rgba(38,166,154,.35)" : "rgba(239,83,80,.35)" });
       }
-      renderSub(false);
     }, 1000);
   }
 
