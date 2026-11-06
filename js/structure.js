@@ -326,6 +326,75 @@ const Structure = (() => {
     return { ...best, next };
   }
 
+  // ── 8. 精简画线：只留"重要的线" ──────────────────────────────────────────────
+  // 把本周期区、大周期区、额外位（昨高/昨低等）合并成一个候选池，重叠的合成一条（多周期共振加分），
+  // 每侧只挑 perSide 条：第 1 条 = 离现价最近的"够格"位（马上会碰到的），其余 = 范围内分数最高的（最硬的）。
+  //   own   : analyze() 结果（定 ATR、现价）
+  //   htfs  : [{ tf, S }]，近 → 远；越远的周期加分越多
+  //   extra : [{ price, score, tag, from }]
+  //   opt   : perSide, maxDist（价格单位）, minScore, ownW（本周期区是否参与：0 = 不参与，例如 3m 图）, strongScore
+  // 分数口径：本周期区 = 触碰数 + 互换位 1；大周期区再加 (1 + 级别序号)；合并后分数相加。
+  // ⚠️ 和本文件其它阈值一样只是显示层规则，没做收益回测。
+  function keyLevels(own, htfs = [], extra = [], opt = {}) {
+    if (!own) return { above: [], below: [] };
+    const close = own.close, atr = own.atrNow;
+    const perSide = opt.perSide ?? 2, maxDist = opt.maxDist ?? 8 * atr, minScore = opt.minScore ?? 2;
+    const strongScore = opt.strongScore ?? 4, ownW = opt.ownW ?? 1;
+    const cands = [];
+    const fromZone = (z, tf, bonus) => ({
+      price: z.price, from: z.from, score: z.touches + (z.flip ? 1 : 0) + bonus,
+      touches: z.touches, flip: !!z.flip, tfs: [tf], members: 1,
+    });
+    if (ownW) for (const z of own.zones.all) cands.push(fromZone(z, own.tf ?? "", 0));
+    htfs.forEach(({ tf, S }, r) => { if (S) for (const z of S.zones.all) cands.push(fromZone(z, tf, 1 + r)); });
+    for (const e of extra) if (isFinite(e.price)) cands.push({ price: e.price, from: e.from, score: e.score, touches: 1, flip: false, tfs: [e.tag], members: 1 });
+    // 只看范围内的，先过滤再合并（远处的位不该通过链式合并"拉近"）
+    const near = cands.filter((c) => Math.abs(c.price - close) <= maxDist).sort((a, b) => a.price - b.price);
+    // 合并：相邻 ≤ 0.5 ATR 且簇总跨度 ≤ 1.2 ATR（防链式合并）
+    const tol = 0.5 * atr, maxSpan = 1.2 * atr;
+    const merged = [];
+    let cur = null;
+    for (const c of near) {
+      if (cur && c.price - cur.hiP <= tol && c.price - cur.loP <= maxSpan) {
+        cur.sw += c.price * c.score; cur.score += c.score; cur.hiP = c.price; cur.members++;
+        cur.touches += c.touches; cur.flip ||= c.flip; cur.from = Math.min(cur.from ?? Infinity, c.from ?? Infinity);
+        for (const t of c.tfs) if (!cur.tfs.includes(t)) cur.tfs.push(t);
+      } else {
+        cur = { ...c, tfs: [...c.tfs], sw: c.price * c.score, loP: c.price, hiP: c.price };
+        merged.push(cur);
+      }
+    }
+    const lv = merged.map((m) => ({
+      price: Math.min(m.hiP, Math.max(m.loP, m.sw / m.score)), score: m.score, touches: m.touches, flip: m.flip,
+      tfs: m.tfs, from: isFinite(m.from) ? m.from : null, lo: m.loP, hi: m.hiP,
+      strong: m.score >= strongScore || m.tfs.length >= 2, // 多个来源重叠 = 共振，也算强
+    }));
+    const dist = (x) => Math.abs(x.price - close);
+    const pick = (arr) => {
+      arr.sort((a, b) => dist(a) - dist(b));
+      const ok = arr.filter((x) => x.score >= minScore);
+      const out = [];
+      const first = ok[0] ?? arr[0]; // 一条够格的都没有时，至少给最近的那个结构点
+      if (first) out.push(first);
+      const rest = ok.filter((x) => x !== first).sort((a, b) => b.score - a.score || dist(a) - dist(b));
+      for (const x of rest) { if (out.length >= perSide) break; out.push(x); }
+      return out.sort((a, b) => dist(a) - dist(b));
+    };
+    return { above: pick(lv.filter((x) => x.price > close)), below: pick(lv.filter((x) => x.price <= close)), all: lv };
+  }
+
+  // 精简趋势线：只要强线（≥3 触），按离现价远近取前 max 条；fallback = 没有强线时允许 1 条候选线
+  // nowTime：求"线离现价多远"用的时刻（默认 = 最后一个摆动点之后的锚点时间）
+  function keyTrendlines(S, opt = {}) {
+    if (!S) return [];
+    const max = opt.max ?? 1;
+    const gap = (L) => Math.abs(lineAt(L, opt.nowTime ?? L.b.time) - S.close);
+    const all = [S.tl.up, S.tl.down].filter(Boolean);
+    let pick = all.filter((L) => L.strong);
+    if (!pick.length && opt.fallback) pick = [...all].sort((a, b) => b.touches - a.touches || gap(a) - gap(b)).slice(0, 1);
+    return pick.sort((a, b) => gap(a) - gap(b)).slice(0, max);
+  }
+
   // ── 汇总 ──────────────────────────────────────────────────────────────────
   // k：已收盘的K线（时间升序）。barSec：周期秒数
   function analyze(k, barSec, opt = {}) {
@@ -366,6 +435,6 @@ const Structure = (() => {
     };
   }
 
-  return { analyze, zigzag, breaks, zones, trendlines, channel, pivotsZs, waves, impulseScore, lineAt, atrOf, MULT };
+  return { analyze, zigzag, breaks, zones, trendlines, channel, pivotsZs, waves, impulseScore, keyLevels, keyTrendlines, lineAt, atrOf, MULT };
 })();
 if (typeof module !== "undefined") module.exports = Structure;

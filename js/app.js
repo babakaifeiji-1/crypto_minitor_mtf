@@ -60,7 +60,8 @@
     { id: "old", name: "策略价位", color: "rgba(239,83,80,.6)", tip: "旧版画法：策略止损用的 15m/1h ★价位 + 4h/日线紫色位" },
     { id: "reg", name: "回归通道", color: "rgba(0,217,255,.95)", tip: "旧版：log 收盘价回归通道 + 底部形态色带 + Donchian 震荡框" },
   ];
-  const LAYER_DEFAULT = { swing: 0, zone: 1, htf: 1, tl: 1, ch: 0, zs: 1, wave: 0, bos: 0, sig: 1, sst: 1, ma: 0, old: 0, reg: 0 };
+  // clean = 精简模式（每个周期只画重要的线，见 CLEAN），不是一个图层，单独一个开关
+  const LAYER_DEFAULT = { clean: 1, swing: 0, zone: 1, htf: 1, tl: 1, ch: 0, zs: 1, wave: 0, bos: 0, sig: 1, sst: 1, ma: 0, old: 0, reg: 0 };
   const LAYER_PRESETS = {
     简洁: { zone: 1, htf: 1, tl: 1, sig: 1, sst: 1 },
     结构: { swing: 1, zone: 1, htf: 1, tl: 1, ch: 1, zs: 1, bos: 1, sig: 1, sst: 1 },
@@ -898,6 +899,86 @@
     return { items, tags };
   }
 
+  // ── 精简模式：每个周期只画"重要的线" ──────────────────────────────────────────
+  // 短线（3m/15m）：价位看近处（可视范围一半以内），本周期噪音多，3m 干脆不画自己的区，只看 15m/1h + 昨日高低；
+  //               趋势线只留 1 条强线（≥3 触），不画已破的线。
+  // 长线（4h/日线）：看更大范围、更硬的位（周线/上周高低），趋势线最多 2 条，没有强线时允许 1 条候选。
+  //   perSide  每侧最多几条（含大周期）     minScore 够格分数（本周期 ×3 / ×2+互换、1h ×2、4h 单点、昨高低）
+  //   range    价位离现价 ≤ range × 可视区高度    tl 本周期趋势线条数    htfTl 投影上一级的强趋势线
+  const CLEAN = {
+    "3m": { perSide: 2, ownW: 0, minScore: 3, prevDay: true, range: 0.5, tl: 0, htfTl: 1, zs: false },
+    "15m": { perSide: 2, ownW: 1, minScore: 3, prevDay: true, range: 0.5, tl: 1, zs: true },
+    "1h": { perSide: 2, ownW: 1, minScore: 3, prevDay: true, range: 0.6, tl: 1, zs: true },
+    "4h": { perSide: 2, ownW: 1, minScore: 3, prevWeek: true, range: 0.6, tl: 2, tlFallback: true, zs: true },
+    "1d": { perSide: 3, ownW: 1, minScore: 3, range: 0.7, tl: 2, tlFallback: true, zs: true },
+  };
+  const tfLabel = (t) => TFS[t]?.label ?? t;
+  const lastClosed = (arr, sec, nowS) => { for (let i = (arr?.length ?? 0) - 1; i >= 0; i--) if (arr[i].time + sec <= nowS) return arr[i]; return null; };
+  // 精简模式的价位选取：图和右侧面板共用，保证两边一致
+  function cleanLevels(sym, S, k, Ly) {
+    const P = CLEAN[state.chartTf] ?? CLEAN["15m"];
+    const d = state.data[sym], nowS = Date.now() / 1000;
+    const vis = k.slice(-(CHART_TF[state.chartTf]?.bars ?? 160));
+    const rng = Math.max(...vis.map((x) => x.high)) - Math.min(...vis.map((x) => x.low));
+    const maxDist = Math.max(3 * S.atrNow, P.range * rng);
+    const htfs = Ly.htf ? (HTF_OF[state.chartTf] ?? []).map((tf) => ({ tf, S: structOf(sym, tf) })) : [];
+    const extra = [];
+    if (Ly.htf && P.prevDay) {
+      const b = lastClosed(d.d1, 86400, nowS);
+      if (b) extra.push({ price: b.high, score: 3, tag: "昨高", from: b.time }, { price: b.low, score: 3, tag: "昨低", from: b.time });
+    }
+    if (Ly.htf && P.prevWeek) {
+      const b = lastClosed(weeklyOf(d), 7 * 86400, nowS);
+      if (b) extra.push({ price: b.high, score: 3, tag: "上周高", from: b.time }, { price: b.low, score: 3, tag: "上周低", from: b.time });
+    }
+    return Structure.keyLevels(S, htfs, extra, { perSide: P.perSide, maxDist, minScore: P.minScore, ownW: Ly.zone ? P.ownW : 0 });
+  }
+  function cleanItems(sym, S, k, sec, Ly) {
+    const items = [], tags = [];
+    const P = CLEAN[state.chartTf] ?? CLEAN["15m"];
+    if (!S || !k.length) return { items, tags };
+    const F = chartFrame(k, sec), { T, snap, futEnd, lastT } = F;
+
+    // 1. 支撑压力：本周期 + 大周期 + 昨日/上周高低，合并后每侧只留 perSide 条（面板「细节」用同一份）
+    if (Ly.zone || Ly.htf) {
+      const KL = cleanLevels(sym, S, k, Ly);
+      const draw = (L, isRes) => {
+        const rgb = isRes ? COL.res : COL.sup;
+        const src = L.tfs.map(tfLabel).join("+");
+        const t0 = L.from != null ? Math.max(snap(L.from), F.t0) : F.t0;
+        items.push({
+          t: "line", t0: T(t0), p0: L.price, t1: T(futEnd), p1: L.price,
+          color: rgba(rgb, L.strong ? 0.95 : 0.6), width: L.strong ? 2 : 1.2, dash: L.strong ? 0 : 1,
+          label: `${isRes ? "压" : "撑"} ${src}${L.touches >= 2 ? " ×" + L.touches : ""}`, lc: rgba(rgb, 1), prio: L.strong ? 1 : 2,
+        });
+        tags.push([L.price, rgba(rgb, 0.95)]);
+      };
+      KL.above.forEach((L) => draw(L, true));
+      KL.below.forEach((L) => draw(L, false));
+    }
+    // 2. 趋势线：只画强线，不画已破的
+    if (Ly.tl) {
+      const tlLine = (L, color, label) => slopeLine(F, L, L.a.time, futEnd, { color, width: L.strong ? 2 : 1.3, dash: L.strong ? 0 : 1, label, lc: color, prio: 2 });
+      for (const L of Structure.keyTrendlines(S, { max: P.tl, fallback: P.tlFallback, nowTime: lastT }))
+        items.push(tlLine(L, L.side === "up" ? COL.up : COL.dn, `${L.touches}触${L.strong ? "" : "·候选"}`));
+      if (P.htfTl) {
+        const tf = HTF_OF[state.chartTf]?.[0], H = tf && structOf(sym, tf);
+        for (const L of Structure.keyTrendlines(H, { max: P.htfTl, nowTime: lastT }))
+          items.push(tlLine(L, rgba(COL.htf[0], 0.9), `${tfLabel(tf)}线 ${L.touches}触`));
+      }
+    }
+    // 3. 中枢：只画仍在延伸的那个
+    if (Ly.zs && P.zs && S.activeZs) {
+      const z = S.activeZs;
+      items.push({ t: "rect", t0: T(snap(z.t0)), t1: T(futEnd), lo: z.zd, hi: z.zg, fill: rgba(COL.zs, 0.05), stroke: rgba(COL.zs, 0.6),
+        edge: "frame", width: 1, dash: 1, label: `中枢 ${z.n}笔`, la: "left", prio: 3 });
+    }
+    // 4. 其它图层（波段 / BOS / 通道 / 波浪）默认关，用户手动打开时照旧画
+    const rest = structItems(S, k, sec, { swing: Ly.swing, bos: Ly.bos, ch: Ly.ch, wave: Ly.wave }, { swingOn: !!Ly.swing });
+    items.push(...rest.items);
+    return { items, tags };
+  }
+
   // 高周期结构的唯一来源：图表和面板都从这里取，保证两边数字一致。
   // rgN 用 30/90，和 strategy.js 里 regimeN、quant/ 第 3 层实验的口径一致
   const STRUCT = {
@@ -1150,11 +1231,17 @@
 
     // ── 新结构图层（structure.js）：本周期 + 上两级周期投影 ─────────────────────
     const S = structOf(sym, state.chartTf);
-    const htfList = Ly.htf ? (HTF_OF[state.chartTf] ?? []).map((tf) => ({ tf, S: structOf(sym, tf) })) : [];
-    const ownZ = S && Ly.zone ? [...S.zones.above, ...S.zones.below, ...(S.zones.inside ? [S.zones.inside] : [])] : [];
-    const htfZ = htfList.flatMap(({ tf, S: H }) => (H ? [...H.zones.above.slice(0, 2), ...H.zones.below.slice(0, 2)].map((z) => ({ ...z, tf })) : []));
-    const own = structItems(S, k, ctf.sec, Ly, { narrow: narrowUi, swingOn: !!Ly.swing, htfZones: htfZ });
-    const hi = Ly.htf ? htfItems(htfList, k, ctf.sec, { own: ownZ, withTl: state.chartTf === "3m" && !!Ly.tl }) : { items: [], tags: [] };
+    let own, hi;
+    if (Ly.clean) {
+      own = cleanItems(sym, S, k, ctf.sec, Ly);
+      hi = { items: [], tags: [] };
+    } else {
+      const htfList = Ly.htf ? (HTF_OF[state.chartTf] ?? []).map((tf) => ({ tf, S: structOf(sym, tf) })) : [];
+      const ownZ = S && Ly.zone ? [...S.zones.above, ...S.zones.below, ...(S.zones.inside ? [S.zones.inside] : [])] : [];
+      const htfZ = htfList.flatMap(({ tf, S: H }) => (H ? [...H.zones.above.slice(0, 2), ...H.zones.below.slice(0, 2)].map((z) => ({ ...z, tf })) : []));
+      own = structItems(S, k, ctf.sec, Ly, { narrow: narrowUi, swingOn: !!Ly.swing, htfZones: htfZ });
+      hi = Ly.htf ? htfItems(htfList, k, ctf.sec, { own: ownZ, withTl: state.chartTf === "3m" && !!Ly.tl }) : { items: [], tags: [] };
+    }
     // 大周期色带先画（在下面），本周期的线压在上面
     items.push(...hi.items, ...own.items);
     // 价格轴标签：太多会叠成一团，离现价 8 ATR 以外的不挂
@@ -1646,9 +1733,14 @@
       const px = d[TFS[main].key]?.[d[TFS[main].key].length - 1]?.close ?? S.close, nowS = Date.now() / 1000;
       const zl = (z, cls, nm) => `<span class="${cls}">${nm} <b class="num">${fmtPrice(z.price)}</b></span> <span class="muted num">${fmtPct(z.price, px)} ${fmtTouch(z)}</span>`;
       const rows = [];
-      const zz = S.zones;
-      rows.push(["压力", zz.above.length ? zz.above.map((z) => zl(z, "short", "")).join(" · ") : '<span class="muted">上方没有近的结构位</span>']);
-      rows.push(["支撑", zz.below.length ? zz.below.map((z) => zl(z, "long", "")).join(" · ") : '<span class="muted">下方没有近的结构位</span>']);
+      const kc = d[TFS[main].key] ?? [];
+      // 精简模式：和图上画的是同一份（含大周期/昨高低，标来源）；完整模式：本周期区
+      const zz = state.layers.clean && kc.length ? cleanLevels(sym, S, kc, state.layers) : S.zones;
+      const zlc = (z, cls) => state.layers.clean
+        ? `<span class="${cls}"><b class="num">${fmtPrice(z.price)}</b></span> <span class="muted num">${fmtPct(z.price, px)} ${z.tfs.map(tfLabel).join("+")}${z.touches >= 2 ? " ×" + z.touches : ""}</span>`
+        : zl(z, cls, "");
+      rows.push(["压力", zz.above.length ? zz.above.map((z) => zlc(z, "short")).join(" · ") : '<span class="muted">上方没有近的结构位</span>']);
+      rows.push(["支撑", zz.below.length ? zz.below.map((z) => zlc(z, "long")).join(" · ") : '<span class="muted">下方没有近的结构位</span>']);
       const tlv = (L, nm, cls) => L ? `<span class="${cls}">${nm} <b class="num">${fmtPrice(Structure.lineAt(L, nowS))}</b></span> <span class="muted">${L.touches}触${L.strong ? "" : "·候选"}</span>` : "";
       const tls = [tlv(S.tl.up, "上升", "long"), tlv(S.tl.down, "下降", "short")].filter(Boolean);
       const brk = [S.tl.upBroken && "上升线刚被跌破", S.tl.downBroken && "下降线刚被突破"].filter(Boolean);
@@ -1692,7 +1784,8 @@
     const chips = LAYERS.map((L, i) => (i === 8 ? '<span class="sep"></span>' : "") +
       `<button class="chip${state.layers[L.id] ? " on" : ""}" data-layer="${L.id}" title="${L.tip}"><i style="background:${L.color}"></i>${L.name}</button>`).join("");
     const presets = Object.keys(LAYER_PRESETS).map((k) => `<button class="chip preset" data-preset="${k}">${k}</button>`).join("");
-    $("layerBar").innerHTML = chips + '<span class="sep"></span>' + presets;
+    const clean = `<button class="chip${state.layers.clean ? " on" : ""}" data-layer="clean" title="精简：每侧只留最重要的 2 条线（日线 3 条），多周期重叠的合成一条；短线和长线用不同规则。关掉 = 显示全部">✂ 精简</button>`;
+    $("layerBar").innerHTML = clean + '<span class="sep"></span>' + chips + '<span class="sep"></span>' + presets;
   }
   function layersChanged() {
     store.save("layers", state.layers);
@@ -1750,7 +1843,7 @@
       const b = e.target.closest("[data-layer],[data-preset]");
       if (!b) return;
       if (b.dataset.layer) state.layers[b.dataset.layer] = state.layers[b.dataset.layer] ? 0 : 1;
-      else state.layers = Object.fromEntries(LAYERS.map((L) => [L.id, LAYER_PRESETS[b.dataset.preset][L.id] ? 1 : 0]));
+      else state.layers = { clean: state.layers.clean, ...Object.fromEntries(LAYERS.map((L) => [L.id, LAYER_PRESETS[b.dataset.preset][L.id] ? 1 : 0])) };
       layersChanged();
     });
 
