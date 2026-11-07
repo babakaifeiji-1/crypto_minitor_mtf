@@ -81,6 +81,15 @@ const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在�
   ];
   // clean = 精简模式（每个周期只画重要的线，见 CLEAN），不是一个图层，单独一个开关
   const LAYER_DEFAULT = { clean: 1, ch: 1, setup: 1, liq: 0, swing: 0, zone: 1, htf: 1, tl: 1, zs: 1, wave: 0, bos: 0, sig: 1, sst: 1, ma: 0, old: 0, reg: 0 };
+  // 看盘模式（只作用于 15m 图）：只留精简后的支撑压力 + 大周期位 + 平行通道 + 形态标记，信号按用户自己的开关。
+  // 其它周期仍用用户自己的图层设置
+  const LOOK_15M = { clean: 1, zone: 1, htf: 1, ch: 1, setup: 1 };
+  const LOOK_TF = "15m";
+  const lookActive = (tf = state.chartTf) => !!state.layers.look && tf === LOOK_TF;
+  function layersFor(tf = state.chartTf) {
+    if (!lookActive(tf)) return state.layers;
+    return { ...Object.fromEntries(LAYERS.map((L) => [L.id, 0])), ...LOOK_15M, sig: state.layers.sig, look: 1 };
+  }
   const LAYER_PRESETS = {
     简洁: { zone: 1, htf: 1, tl: 1, ch: 1, sig: 1, sst: 1 },
     结构: { swing: 1, zone: 1, htf: 1, tl: 1, ch: 1, zs: 1, bos: 1, sig: 1, sst: 1 },
@@ -99,10 +108,10 @@ const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在�
     flashUntil: {}, // sym -> 时间戳，卡片闪烁
     chTf: store.load("chTf", "1d"), // 15m 图上「趋势通道」面板的周期档位："1d" 或 "4h"
     chartTf: store.load("chartTf", "15m"), // 主图周期："3m" / "15m"（短线）/ "1h" / "4h" / "1d"（长线）
-    layers: { ...LAYER_DEFAULT, ...store.load("layers", {}), ...(store.load("layersVer", 0) < 2 ? { ch: 1 } : {}), ...(store.load("layersVer", 0) < 3 ? { setup: 1 } : {}) }, // 图上各图层开关，见 LAYERS
+    layers: { ...LAYER_DEFAULT, ...store.load("layers", {}), ...(store.load("layersVer", 0) < 2 ? { ch: 1 } : {}), ...(store.load("layersVer", 0) < 3 ? { setup: 1 } : {}), ...(store.load("layersVer", 0) < 4 ? { look: 1 } : {}) }, // 图上各图层开关，见 LAYERS
   };
   state.active = state.symbols[0];
-  store.save("layersVer", 3); // v2：平行通道改成锚点法后默认打开；v3：新增形态 A/B/C 图层
+  store.save("layersVer", 4); // v4：新增 15m 看盘模式（默认开） // v2：平行通道改成锚点法后默认打开；v3：新增形态 A/B/C 图层
 
   const $ = (id) => document.getElementById(id);
   const decimals = (p) => (p >= 1000 ? 2 : p >= 10 ? 3 : p >= 1 ? 4 : 6);
@@ -1424,7 +1433,7 @@ const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在�
     stUpS.setData(k.map((x, i) => (ind.st.dir[i] === 1 ? { time: T(x.time), value: ind.st.line[i] } : { time: T(x.time) })));
     stDnS.setData(k.map((x, i) => (ind.st.dir[i] === -1 ? { time: T(x.time), value: ind.st.line[i] } : { time: T(x.time) })));
 
-    const Ly = state.layers;
+    const Ly = layersFor();
     [ema9S, ema21S, stUpS, stDnS].forEach((x) => x.applyOptions({ visible: !!Ly.ma }));
 
     // 信号标记只在 15m 图上有意义（信号就是 15m 收盘判定的）
@@ -1712,7 +1721,7 @@ const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在�
     const sym = state.active, d = state.data[sym];
     const sess = sessionOf(sym);
     const lg = (c, t) => `<span><i style="background:${c}"></i>${t}</span>`;
-    const Ly = state.layers, htfs = (HTF_OF[state.chartTf] ?? []).map((t) => TFS[t].label).join("/");
+    const Ly = layersFor(), htfs = (HTF_OF[state.chartTf] ?? []).map((t) => TFS[t].label).join("/");
     const lgParts = [];
     if (Ly.zone) lgParts.push(lg("rgba(239,83,80,.8)", "压力区") + lg("rgba(38,166,154,.8)", "支撑区"));
     if (Ly.htf && htfs) lgParts.push(lg(rgba(COL.htf[0], .9), `${htfs} 大周期区`));
@@ -1991,8 +2000,9 @@ const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在�
       const rows = [];
       const kc = d[TFS[main].key] ?? [];
       // 精简模式：和图上画的是同一份（含大周期/昨高低，标来源）；完整模式：本周期区
-      const zz = state.layers.clean && kc.length ? cleanLevels(sym, S, kc, state.layers) : S.zones;
-      const zlc = (z, cls) => state.layers.clean
+      const LyP = layersFor(main);
+      const zz = LyP.clean && kc.length ? cleanLevels(sym, S, kc, LyP) : S.zones;
+      const zlc = (z, cls) => LyP.clean
         ? `<span class="${cls}"><b class="num">${fmtPrice(z.price)}</b></span> <span class="muted num">${fmtPct(z.price, px)} ${z.tfs.map(tfLabel).join("+")}${z.touches >= 2 ? " ×" + z.touches : ""}</span>`
         : zl(z, cls, "");
       rows.push(["压力", zz.above.length ? zz.above.map((z) => zlc(z, "short")).join(" · ") : '<span class="muted">上方没有近的结构位</span>']);
@@ -2096,11 +2106,13 @@ const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在�
   }
 
   function renderLayerBar() {
+    const Ly = layersFor(); // 看盘模式下显示实际生效的图层
     const chips = LAYERS.map((L, i) => (L.id === "setup" ? '<span class="sep"></span>' : "") +
-      `<button class="chip${state.layers[L.id] ? " on" : ""}" data-layer="${L.id}" title="${L.tip}"><i style="background:${L.color}"></i>${L.name}</button>`).join("");
+      `<button class="chip${Ly[L.id] ? " on" : ""}" data-layer="${L.id}" title="${L.tip}"><i style="background:${L.color}"></i>${L.name}</button>`).join("");
     const presets = Object.keys(LAYER_PRESETS).map((k) => `<button class="chip preset" data-preset="${k}">${k}</button>`).join("");
     const clean = `<button class="chip${state.layers.clean ? " on" : ""}" data-layer="clean" title="精简：每侧只留最重要的 2 条线（日线 3 条），多周期重叠的合成一条；短线和长线用不同规则。关掉 = 显示全部">✂ 精简</button>`;
-    $("layerBar").innerHTML = clean + '<span class="sep"></span>' + chips + '<span class="sep"></span>' + presets;
+    const look = `<button class="chip${state.layers.look ? " on" : ""}" data-layer="look" title="看盘模式：15m 图只显示精简后的支撑压力、大周期位、平行通道和形态标记（信号按你自己的开关）。其它周期不受影响。在 15m 上点任何图层会退出看盘模式">👁 看盘·15m</button>`;
+    $("layerBar").innerHTML = look + clean + '<span class="sep"></span>' + chips + '<span class="sep"></span>' + presets;
   }
   function layersChanged() {
     store.save("layers", state.layers);
@@ -2147,6 +2159,8 @@ const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在�
       state.chartTf = b.dataset.ctf;
       store.save("chartTf", state.chartTf);
       syncChartTfBtns();
+      renderLayerBar(); // 看盘模式只作用于 15m，切周期后图层条要跟着变
+      htmlCache.legend = null;
       htmlCache.chartTitle = null;
       chartKey = "";
       renderSide();
@@ -2157,8 +2171,11 @@ const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在�
     $("layerBar").addEventListener("click", (e) => {
       const b = e.target.closest("[data-layer],[data-preset]");
       if (!b) return;
-      if (b.dataset.layer) state.layers[b.dataset.layer] = state.layers[b.dataset.layer] ? 0 : 1;
-      else state.layers = { clean: state.layers.clean, ...Object.fromEntries(LAYERS.map((L) => [L.id, LAYER_PRESETS[b.dataset.preset][L.id] ? 1 : 0])) };
+      const id = b.dataset.layer;
+      // 看盘模式下在 15m 上改图层：先把当前生效的那套变成自己的设置，再退出看盘模式
+      if (lookActive() && id !== "look") state.layers = { ...layersFor(), look: 0 };
+      if (id) state.layers[id] = state.layers[id] ? 0 : 1;
+      else state.layers = { look: 0, clean: state.layers.clean, ...Object.fromEntries(LAYERS.map((L) => [L.id, LAYER_PRESETS[b.dataset.preset][L.id] ? 1 : 0])) };
       layersChanged();
     });
 
