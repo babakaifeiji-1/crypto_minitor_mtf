@@ -231,9 +231,10 @@ export const Structure = (() => {
     if (!best) return null;
     const { dir, L, offset, tb, to, breakJ } = best;
     const tEnd = k[n - 1].time, c = k[n - 1].close;
-    const flat = Math.abs(L.slope * (tEnd - L.t0)) < 0.5 * atrNow;
     const lowerAt = (t) => Math.min(lineAt(L, t), lineAt(L, t) + offset);
     const width = Math.abs(offset);
+    // 整段通道的升降幅度不到通道宽度的 1/4 → 叫水平通道（就是区间）
+    const flat = Math.abs(L.slope * (tEnd - L.t0)) < 0.25 * width;
     return {
       kind: flat ? "水平通道" : dir > 0 ? "上升通道" : "下降通道", dir,
       base: L, offset, touchesBase: tb, touchesOpp: to, oppTouches: to, touches: tb + to,
