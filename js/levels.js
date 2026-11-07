@@ -1,6 +1,6 @@
 // 支撑 / 压力位：纯K线摆动高低点 + 前一日高低点，聚类成价格区
 // 严格无未来函数：在第 i 根K线上只使用当时已确认的摆动点
-const Levels = (() => {
+export const Levels = (() => {
   // 摆动点：第 j 根的高点是前后 n 根中最高 → 摆动高点，要等到 j+n 根收盘才确认
   function pivots(k, n, barSec, weight, src) {
     const out = [];
@@ -339,3 +339,4 @@ const Levels = (() => {
 
   return { prepare, at, nearest, daily, htf, channel, regime, channelFits, regimeFits, asOf, evalFit, testState, rejection };
 })();
+export default Levels;

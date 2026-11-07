@@ -1,9 +1,10 @@
-'use strict';
 // 验证 js/structure.js：合成数据上的已知答案 + 真实K线上的因果性和数量控制
 // 运行：node test/structure_test.js
-const fs = require('fs');
-const path = require('path');
-const S = require('../js/structure.js');
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+import S from '../js/structure.js';
 
 // 真实K线目录：默认是仓库旁边的 ../quant/data/csv，可用环境变量 QUANT_CSV 覆盖
 const CSV = process.env.QUANT_CSV || path.join(__dirname, '..', '..', 'quant', 'data', 'csv');

@@ -1,9 +1,10 @@
-'use strict';
 // 验证 Structure.keyLevels / keyTrendlines（精简画线）：规则正确 + 真实数据上画线条数确实变少
 // 运行：node test/keylevels_test.js
-const fs = require('fs');
-const path = require('path');
-const S = require('../js/structure.js');
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+import S from '../js/structure.js';
 
 const CSV = process.env.QUANT_CSV || path.join(__dirname, '..', '..', 'quant', 'data', 'csv');
 let pass = 0, fail = 0;

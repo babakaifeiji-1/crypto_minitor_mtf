@@ -1,0 +1,9 @@
+{
+  "name": "crypto-minitor-mtf",
+  "private": true,
+  "type": "module",
+  "description": "盯盘助手 MTF：纯前端（原生 ES modules，无构建），GitHub Pages 部署",
+  "scripts": {
+    "test": "node test/run_all.js"
+  }
+}

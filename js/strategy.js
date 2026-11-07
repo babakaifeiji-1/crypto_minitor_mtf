@@ -1,6 +1,8 @@
+import { TA } from "./indicators.js";
+import { Levels } from "./levels.js";
 // 策略：1h 定方向 + 15m 多指标共振打分 + 入场触发形态
 // 只在已收盘K线上判定信号（不重绘），当前未收盘K线只显示"形成中"状态
-const Strategy = (() => {
+export const Strategy = (() => {
   const DEFAULTS = {
     scoreThreshold: 65, // 共振分数阈值，越高信号越少、胜率越高
     strictHtf: true, // 必须与 1h 趋势同向
@@ -453,3 +455,4 @@ const Strategy = (() => {
 
   return { DEFAULTS, run, liveState, exitWarning, simulate, isWeekend, signalStatus, trendSeries, trendAt };
 })();
+export default Strategy;

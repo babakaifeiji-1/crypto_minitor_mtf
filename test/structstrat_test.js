@@ -1,9 +1,10 @@
-'use strict';
 // 验证 js/structstrat.js：合成数据上的手算结果 + 真实数据截断不变（无未来函数）+ 成本口径
 // 运行：node test/structstrat_test.js
-const fs = require('fs');
-const path = require('path');
-const SS = require('../js/structstrat.js');
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+import SS from '../js/structstrat.js';
 
 const CSV = process.env.QUANT_CSV || path.join(__dirname, '..', '..', 'quant', 'data', 'csv');
 let pass = 0, fail = 0;

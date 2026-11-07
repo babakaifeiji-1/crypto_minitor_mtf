@@ -1,5 +1,5 @@
 // 技术指标库：所有函数返回与输入等长的数组，预热期为 NaN
-const TA = (() => {
+export const TA = (() => {
   const nanArr = (n) => new Array(n).fill(NaN);
 
   function sma(src, n) {
@@ -137,3 +137,4 @@ const TA = (() => {
 
   return { sma, ema, rma, atr, rsi, macd, adx, supertrend, highest, lowest };
 })();
+export default TA;

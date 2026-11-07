@@ -1,3 +1,4 @@
+import { Structure } from "./structure.js";
 // 结构策略（v1）：大周期定方向，小周期等回调结束（顺大周期方向的 CHoCH/BOS）入场，止损放在回调极值外。
 //
 // 规则（全部只用当时已知的数据）：
@@ -12,8 +13,8 @@
 //   6. 同一品种同一时间只有一笔（含挂单），前一笔结束前的新触发忽略。
 //
 // 成本（R 为单位）在 cost() 里按"每条腿"算：吃单腿 taker 费 + 滑点，挂单腿 maker 费、无滑点。
-const StructStrat = (() => {
-  const S = typeof Structure !== "undefined" ? Structure : require("./structure.js");
+export const StructStrat = (() => {
+  const S = Structure;
 
   const DEFAULTS = {
     // 默认值 = 实验十三在 1h→4h 上按样本内挑出的组合（见 README「结构策略」）
@@ -161,4 +162,4 @@ const StructStrat = (() => {
 
   return { run, cost, htfBiasFn, DEFAULTS };
 })();
-if (typeof module !== "undefined") module.exports = StructStrat;
+export default StructStrat;

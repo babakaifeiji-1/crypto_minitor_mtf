@@ -1,6 +1,6 @@
 // Telegram 推送：浏览器直接调用 Bot API（表单 POST，属于"简单请求"，不触发跨域预检）
 // 配置保存在本机 localStorage，不会写进代码里
-const Push = (() => {
+export const Push = (() => {
   // 和原版 crypto_minitor 同 origin，键名必须区分，否则「本机负责推送」会同时在两个看板打开 → 重复推送
   const KEY = "mtf_push";
   const DEFAULTS = {
@@ -79,3 +79,4 @@ const Push = (() => {
 
   return { get config() { return cfg; }, save, send, detectChatId, test, ready };
 })();
+export default Push;

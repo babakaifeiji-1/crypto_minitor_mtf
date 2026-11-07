@@ -1,18 +1,14 @@
-'use strict';
 // 验证 MTF 新增的三个函数：htf / channel / regime
 // 用 quant/data/csv 的真实币安K线。运行：node test/levels_mtf_test.js
-const fs = require('fs');
-const path = require('path');
-const vm = require('vm');
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+import { Levels } from '../js/levels.js';
 
 const CSV = process.env.QUANT_CSV || path.join(__dirname, '..', '..', 'quant', 'data', 'csv');
-const SRC = path.join(__dirname, '..', 'js', 'levels.js');
 
-// levels.js 是浏览器脚本（顶层 const Levels），用 vm 取出来
-const ctx = { console };
-vm.createContext(ctx);
-vm.runInContext(fs.readFileSync(SRC, 'utf8') + '\n;globalThis.__L = Levels;', ctx);
-const L = ctx.__L;
+const L = Levels;
 
 function load(sym, tf, months) {
   const out = [];

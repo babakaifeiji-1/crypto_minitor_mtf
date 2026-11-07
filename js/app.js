@@ -1,5 +1,12 @@
-// 盯盘助手主程序：数据加载 / WebSocket 实时更新 / 图表 / 提醒
-(() => {
+// 盯盘助手主程序：数据加载 / WebSocket 实时更新 / 图表 / 提醒（ES module，无构建，GitHub Pages 直接加载）
+import { TA } from "./indicators.js";
+import { Levels } from "./levels.js";
+import { Structure } from "./structure.js";
+import { StructStrat } from "./structstrat.js";
+import { Strategy } from "./strategy.js";
+import { Push } from "./push.js";
+const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在全局
+{
   const LTF = "15m", HTF = "1h";
   const LTF_SEC = 900;
   const REST = "https://fapi.binance.com";
@@ -2032,4 +2039,4 @@
   }
 
   main();
-})();
+}

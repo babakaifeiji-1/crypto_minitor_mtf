@@ -14,7 +14,7 @@
 //
 // ⚠️ 本文件所有阈值（ZigZag 倍数、容差、触碰数、打分权重）只经过形态层面的检查
 // （test/structure_test.js），没有做过收益回测。只用于画图辅助人工判断，不参与信号和止损。
-const Structure = (() => {
+export const Structure = (() => {
   // 各周期默认 ZigZag 倍数（× ATR14）。test/structure_test.js 在真实数据上统计过：
   // 这组倍数下每一笔平均约 10 根K线，图上 160 根左右的可视范围约 15 个转折点（各周期一致）
   const MULT = { 180: 2.4, 900: 2.2, 3600: 2.2, 14400: 2.2, 86400: 2.1 };
@@ -437,4 +437,4 @@ const Structure = (() => {
 
   return { analyze, zigzag, breaks, zones, trendlines, channel, pivotsZs, waves, impulseScore, keyLevels, keyTrendlines, lineAt, atrOf, MULT };
 })();
-if (typeof module !== "undefined") module.exports = Structure;
+export default Structure;
