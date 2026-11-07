@@ -92,6 +92,17 @@ console.log('1. 合成数据');
   ok(r.channel && r.channel.kind === '上升通道', `应识别出上升通道，实际 ${r.channel?.kind}`);
   if (r.channel?.offset) ok(Math.abs(r.channel.offset - 10) < 2.5, `通道宽度 ≈10，实际 ${r.channel.offset.toFixed(2)}`);
 }
+{
+  // 下降通道（镜像）+ 两条线必须平行（同一斜率）、两边都 ≥2 次触碰
+  const P = [130, 120, 126, 116, 122, 112, 118, 108, 114, 104, 110];
+  const r = S.analyze(synth(P, 10, 900, 0.1), 900);
+  ok(r.channel && r.channel.kind === '下降通道' && r.channel.offset < 0, `应识别出下降通道，实际 ${r.channel?.kind}`);
+  ok(r.channel && r.channel.touchesBase >= 2 && r.channel.touchesOpp >= 2, '两高两低');
+  // 震荡（高低点都水平）→ 水平通道
+  const Q = [100, 110, 101, 109.5, 100.5, 110, 100, 109.5, 100.5, 110, 105];
+  const q = S.analyze(synth(Q, 10, 900, 0.1), 900);
+  ok(!q.channel || q.channel.kind === '水平通道', `横盘应为水平通道或不画，实际 ${q.channel?.kind}`);
+}
 
 // ─── 2. 真实数据：因果性 + 数量控制 ───────────────────────────────────────────
 console.log('2. 真实数据');
@@ -127,6 +138,15 @@ for (const sym of SYMS) for (const [tf, sec] of TFS) {
   if (r.tl.down) ok(S.lineAt(r.tl.down, lastT) >= r.close - 0.25 * r.atrNow - 1e-9, `${sym} ${tf} 下降趋势线在价格上方`);
   ok(r.zs.every((z) => z.zg > z.zd && z.gg >= z.zg && z.dd <= z.zd && z.n >= 3), `${sym} ${tf} 中枢 GG≥ZG>ZD≥DD`);
   if (r.wave) ok(r.wave.pts.every((p, i) => i === 0 || p.time > r.wave.pts[i - 1].time), `${sym} ${tf} 波浪点时间递增`);
+  // 平行通道：两高两低；从起点到现在（或破位）收盘都在通道 ±0.5ATR 内
+  if (r.channel) {
+    const c = r.channel, L = c.base, end = c.broken ? c.breakJ - 1 : k.length - 1;
+    ok(c.touchesBase >= 2 && c.touchesOpp >= 2 && c.widthAtr >= 1.5 && c.widthAtr <= 15, `${sym} ${tf} 通道触碰/宽度`);
+    let inside = true;
+    for (let j = L.a.i; j <= end; j++) { const b0 = S.lineAt(L, k[j].time), lo = Math.min(b0, b0 + c.offset), hi = Math.max(b0, b0 + c.offset); if (k[j].close < lo - 0.5 * r.atrNow - 1e-9 || k[j].close > hi + 0.5 * r.atrNow + 1e-9) inside = false; }
+    ok(inside, `${sym} ${tf} 通道内收盘`);
+    ok(!c.broken || k.length - 1 - c.breakJ <= 20, `${sym} ${tf} 只保留最近破的通道`);
+  }
   // 统计：在这段数据里取 12 个历史时刻，各自只用截至当时的 600 根（≈ 图上能看到的量）
   const s = (stats[tf] ??= { n: 0, leg: 0, sw160: 0, tlUp: 0, tlDn: 0, strong: 0, ch: 0, zs: 0, wave: 0, z: 0, inZs: 0 });
   for (let q = 0; q < 12; q++) {

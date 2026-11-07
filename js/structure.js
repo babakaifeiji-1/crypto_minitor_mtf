@@ -185,37 +185,64 @@ export const Structure = (() => {
     return res;
   }
 
-  // ── 5. 平行通道 / 三角形 ─────────────────────────────────────────────────────
-  // 以趋势线为基线，过区间内离基线最远的对侧极值画平行线。对侧也要有 ≥2 个摆动点贴近（0.5 ATR），
-  // 才算"价格真的在通道里走"，否则不画。上下两条趋势线同时有效 → 收敛/扩散形态，不当通道
-  function channel(k, swings, tl, atrNow) {
+  // ── 5. 平行通道（锚点法，手画通道的标准画法）─────────────────────────────────
+  // 上升通道：两个依次抬高的已确认低点 A、B 连成下轨；过 A、B 之间最高的已确认高点画平行线作上轨。
+  // 有效条件（缺一不画）：
+  //   * 下轨 ≥2 个低点、上轨 ≥2 个高点贴线（离线 ≤ 0.35 ATR）—— "两高两低"
+  //   * 从 A 到现在收盘价没有跑出通道 0.5 ATR 以外；B 之前就跑出 = 不成立，B 之后跑出 = 已破（只保留最近 20 根内破的）
+  //   * 宽度 1.5~15 ATR，跨度 ≥ 20 根
+  // 下降通道镜像（两个依次降低的高点作上轨）。斜率很小的叫水平通道（就是区间）。
+  // 多个候选按"触碰数 + 是否仍有效 + 新近度"取一个。只用已确认摆动点和已收盘K线。
+  function channel(k, swings, tl, atrNow, opt = {}) {
     const n = k.length;
-    const up = tl.up, dn = tl.down;
-    if (up && dn && up.strong && dn.strong) {
-      const t = k[n - 1].time, w = lineAt(dn, t) - lineAt(up, t);
-      const t0 = Math.max(up.t0, dn.t0), w0 = lineAt(dn, t0) - lineAt(up, t0);
-      if (w > 0) return { kind: w < w0 * 0.8 ? "三角收敛" : w > w0 * 1.25 ? "扩散" : "矩形", up, dn };
-    }
-    const cands = [up, dn].filter(Boolean).sort((a, b) => b.touches - a.touches || b.b.i - a.b.i);
-    for (const base of cands) {
-      const isUp = base.side === "up";
-      let off = 0, offI = -1;
-      for (let j = base.a.i; j < n; j++) {
-        const v = isUp ? k[j].high - lineAt(base, k[j].time) : lineAt(base, k[j].time) - k[j].low;
-        if (v > off) { off = v; offI = j; }
+    if (n < 30 || !(atrNow > 0)) return null;
+    const tolT = (opt.chTouchAtr ?? 0.35) * atrNow, tolB = 0.5 * atrNow;
+    const recent = swings.slice(-(opt.chSwings ?? 16));
+    let best = null;
+    for (const dir of [1, -1]) {
+      const base = recent.filter((s) => s.type === (dir > 0 ? "L" : "H"));
+      const opp = recent.filter((s) => s.type === (dir > 0 ? "H" : "L"));
+      for (let a = 0; a < base.length - 1; a++) for (let b = a + 1; b < base.length; b++) {
+        const A = base[a], B = base[b];
+        if (B.i - A.i < 6) continue;
+        if (dir > 0 ? B.price <= A.price - tolT : B.price >= A.price + tolT) continue; // 上升通道下轨不能明显向下
+        const L = { t0: A.time, p0: A.price, slope: (B.price - A.price) / (B.time - A.time) };
+        // 对边：A、B 之间最极端的对侧摆动点
+        let off = 0;
+        for (const o of opp) if (o.i > A.i && o.i < B.i) off = Math.max(off, (o.price - lineAt(L, o.time)) * dir);
+        if (off < 1.5 * atrNow || off > 15 * atrNow) continue;
+        const offset = dir * off;
+        const lo = (t) => Math.min(lineAt(L, t), lineAt(L, t) + offset), hi = (t) => Math.max(lineAt(L, t), lineAt(L, t) + offset);
+        let ok = true, breakJ = -1;
+        for (let j = A.i; j < n; j++) {
+          const c = k[j].close, t = k[j].time;
+          if (c < lo(t) - tolB || c > hi(t) + tolB) { if (j <= B.i) ok = false; else breakJ = j; break; }
+        }
+        if (!ok || n - 1 - A.i < 20) continue;
+        if (breakJ >= 0 && n - 1 - breakJ > 20) continue;
+        const endI = breakJ >= 0 ? breakJ : n - 1;
+        const tb = base.filter((s) => s.i >= A.i && s.i <= endI && Math.abs(s.price - lineAt(L, s.time)) <= tolT).length;
+        const to = opp.filter((s) => s.i >= A.i && s.i <= endI && Math.abs(s.price - (lineAt(L, s.time) + offset)) <= tolT).length;
+        if (tb < 2 || to < 2) continue;
+        const sc = tb + to + (breakJ < 0 ? 3 : 0) + B.i / n;
+        if (!best || sc > best.sc) best = { dir, L: { ...L, a: A, b: B }, offset, tb, to, breakJ, sc };
       }
-      if (offI < 0 || off < 2 * atrNow || off > 15 * atrNow) continue;
-      const opp = swings.filter((s) => s.type === (isUp ? "H" : "L") && s.i >= base.a.i);
-      const oppT = opp.filter((s) => Math.abs(s.price - (lineAt(base, s.time) + (isUp ? off : -off))) <= 0.5 * atrNow).length;
-      if (oppT < 2) continue;
-      const lo = isUp ? 0 : -off, hi = isUp ? off : 0;
-      const c = k[n - 1].close, b = lineAt(base, k[n - 1].time);
-      return {
-        kind: isUp ? "上升通道" : "下降通道", base, offset: isUp ? off : -off, oppTouches: oppT,
-        t0: base.t0, pos: (c - (b + lo)) / (hi - lo), // 0 = 下沿 1 = 上沿
-      };
     }
-    return null;
+    if (!best) return null;
+    const { dir, L, offset, tb, to, breakJ } = best;
+    const tEnd = k[n - 1].time, c = k[n - 1].close;
+    const flat = Math.abs(L.slope * (tEnd - L.t0)) < 0.5 * atrNow;
+    const lowerAt = (t) => Math.min(lineAt(L, t), lineAt(L, t) + offset);
+    const width = Math.abs(offset);
+    return {
+      kind: flat ? "水平通道" : dir > 0 ? "上升通道" : "下降通道", dir,
+      base: L, offset, touchesBase: tb, touchesOpp: to, oppTouches: to, touches: tb + to,
+      t0: L.t0, from: L.a.time,
+      broken: breakJ >= 0, breakJ, breakTime: breakJ >= 0 ? k[breakJ].time : null,
+      breakUp: breakJ >= 0 ? k[breakJ].close > lowerAt(k[breakJ].time) + width : null,
+      pos: (c - lowerAt(tEnd)) / width, // 0 = 下沿 1 = 上沿
+      widthAtr: width / atrNow,
+    };
   }
 
   // ── 6. 中枢（缠论笔中枢）────────────────────────────────────────────────────

@@ -66,7 +66,7 @@ const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在�
     { id: "zone", name: "支撑压力", color: "#ef5350", tip: "本周期摆动点聚类成区，每侧最多 2 个；×N = 触碰次数，⇅ = 支撑压力互换过" },
     { id: "htf", name: "大周期位", color: "rgba(188,148,255,.95)", tip: "上两级周期的支撑压力区，投影到本图（半透明色带）" },
     { id: "tl", name: "趋势线", color: "#26a69a", tip: "已确认低点/高点连线；实线 ≥3 次触碰，虚线 = 2 次（候选），灰色 = 最近被收盘击穿" },
-    { id: "ch", name: "通道", color: "#4c8dff", tip: "趋势线 + 过对侧极值的平行线；对侧也要 ≥2 次触碰才画。两条线收敛时标三角形" },
+    { id: "ch", name: "平行通道", color: "rgb(64,196,255)", tip: "锚点法：两个依次抬高的低点连下轨，过中间最高点画平行上轨（下降通道镜像）。两条线都要 ≥2 次触碰、收盘没跑出通道才画；上升蓝 / 下降橙 / 已破灰，● = 锚点" },
     { id: "zs", name: "中枢", color: "rgba(255,170,40,.95)", tip: "缠论笔中枢：至少 3 笔重叠的区间 [ZD, ZG]，就是震荡区间" },
     { id: "wave", name: "波浪", color: "#00d9ff", tip: "推动浪/ABC 候选：只保留满足三条铁律、斐波那契比例最贴近的一组" },
     { id: "bos", name: "BOS/CHoCH", color: "#f5c542", tip: "BOS = 顺势突破前高/前低；CHoCH = 逆势突破，结构可能转变" },
@@ -77,9 +77,9 @@ const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在�
     { id: "reg", name: "回归通道", color: "rgba(0,217,255,.95)", tip: "旧版：log 收盘价回归通道 + 底部形态色带 + Donchian 震荡框" },
   ];
   // clean = 精简模式（每个周期只画重要的线，见 CLEAN），不是一个图层，单独一个开关
-  const LAYER_DEFAULT = { clean: 1, swing: 0, zone: 1, htf: 1, tl: 1, ch: 0, zs: 1, wave: 0, bos: 0, sig: 1, sst: 1, ma: 0, old: 0, reg: 0 };
+  const LAYER_DEFAULT = { clean: 1, ch: 1, swing: 0, zone: 1, htf: 1, tl: 1, zs: 1, wave: 0, bos: 0, sig: 1, sst: 1, ma: 0, old: 0, reg: 0 };
   const LAYER_PRESETS = {
-    简洁: { zone: 1, htf: 1, tl: 1, sig: 1, sst: 1 },
+    简洁: { zone: 1, htf: 1, tl: 1, ch: 1, sig: 1, sst: 1 },
     结构: { swing: 1, zone: 1, htf: 1, tl: 1, ch: 1, zs: 1, bos: 1, sig: 1, sst: 1 },
     波浪: { swing: 1, wave: 1, zone: 1, sig: 1 },
   };
@@ -96,9 +96,10 @@ const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在�
     flashUntil: {}, // sym -> 时间戳，卡片闪烁
     chTf: store.load("chTf", "1d"), // 15m 图上「趋势通道」面板的周期档位："1d" 或 "4h"
     chartTf: store.load("chartTf", "15m"), // 主图周期："3m" / "15m"（短线）/ "1h" / "4h" / "1d"（长线）
-    layers: { ...LAYER_DEFAULT, ...store.load("layers", {}) }, // 图上各图层开关，见 LAYERS
+    layers: { ...LAYER_DEFAULT, ...store.load("layers", {}), ...(store.load("layersVer", 0) < 2 ? { ch: 1 } : {}) }, // 图上各图层开关，见 LAYERS
   };
   state.active = state.symbols[0];
+  store.save("layersVer", 2); // v2：平行通道改成锚点法后默认打开
 
   const $ = (id) => document.getElementById(id);
   const decimals = (p) => (p >= 1000 ? 2 : p >= 10 ? 3 : p >= 1 ? 4 : 6);
@@ -875,7 +876,7 @@ const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在�
   const COL = {
     res: "239,83,80", sup: "38,166,154", mid: "245,197,66", htf: ["188,148,255", "255,128,200"], zs: "255,170,40",
     up: "#26a69a", dn: "#ef5350", broken: "rgba(140,150,170,.55)", ch: "rgba(96,156,255,.8)", chFill: "rgba(96,156,255,.05)",
-    swing: "rgba(200,206,220,.32)", wave: "#00d9ff", bos: "#f5c542",
+    swing: "rgba(200,206,220,.32)", wave: "#00d9ff", bos: "#f5c542", chUp: "64,196,255", chDn: "255,138,101",
   };
   function chartFrame(k, sec) {
     const T = (t) => t + TZ;
@@ -961,21 +962,23 @@ const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在�
           items.push({ t: "text", time: T(snap(B.breakTime)), price: Structure.lineAt(B, B.breakTime), text: "破", pos: B.side === "up" ? "below" : "above", color: "rgba(170,180,200,.9)", size: 9.5, prio: 5 });
         }
       }
+      // 平行通道：上下两条线同色、同线宽、实线，成对出现；中线细虚线；通道内淡填充。
+      // 已破的通道变灰、只画到破位那根
       const ch = S.channel;
       if (Ly.ch && ch) {
-        if (ch.base) {
-          const P = { t0: ch.base.t0, p0: ch.base.p0 + ch.offset, slope: ch.base.slope };
-          items.push(slopeLine(F, P, ch.base.a.time, futEnd, { color: COL.ch, width: 1.2, dash: 1, label: `${ch.kind.replace("通道", "")}通道 ${Math.round(ch.pos * 100)}%`, lc: COL.ch, prio: 3 }));
-          if (!Ly.tl) items.push(tlLine(ch.base, COL.ch));
-          const ts = k.filter((x) => x.time >= ch.base.a.time).map((x) => x.time).concat([futEnd]);
-          items.push({ t: "band", fill: COL.chFill, pts: ts.map((t) => { const b = Structure.lineAt(ch.base, t); return { time: T(t), up: Math.max(b, b + ch.offset), dn: Math.min(b, b + ch.offset) }; }) });
-        } else if (ch.up && ch.dn) {
-          const t0 = Math.max(ch.up.a.time, ch.dn.a.time);
-          const ts = k.filter((x) => x.time >= t0).map((x) => x.time).concat([futEnd]);
-          items.push({ t: "band", fill: "rgba(245,197,66,.05)", pts: ts.map((t) => ({ time: T(t), up: Structure.lineAt(ch.dn, t), dn: Structure.lineAt(ch.up, t) })) });
-          if (!Ly.tl) { items.push(tlLine(ch.up, COL.up)); items.push(tlLine(ch.dn, COL.dn)); }
-          items.push({ t: "text", time: T(snap(t0)), price: Structure.lineAt(ch.dn, t0), text: ch.kind, pos: "above", color: "#f5c542", size: 10, prio: 3 });
-        }
+        const rgb = ch.broken ? "140,150,170" : ch.dir > 0 ? COL.chUp : COL.chDn;
+        const L = ch.base, tEnd = ch.broken ? ch.breakTime : futEnd;
+        const U = { t0: L.t0, p0: L.p0 + ch.offset, slope: L.slope }, M = { t0: L.t0, p0: L.p0 + ch.offset / 2, slope: L.slope };
+        const lbl = `${ch.kind}${ch.broken ? "（已破）" : ` ${Math.round(ch.pos * 100)}%`} · ${ch.dir > 0 ? `${ch.touchesBase}低${ch.touchesOpp}高` : `${ch.touchesBase}高${ch.touchesOpp}低`}`;
+        const top = ch.offset > 0 ? U : L, bot = ch.offset > 0 ? L : U;
+        items.push(slopeLine(F, top, L.a.time, tEnd, { color: rgba(rgb, 0.9), width: 1.6, label: lbl, lc: rgba(rgb, 1), prio: 2 }));
+        items.push(slopeLine(F, bot, L.a.time, tEnd, { color: rgba(rgb, 0.9), width: 1.6 }));
+        items.push(slopeLine(F, M, L.a.time, tEnd, { color: rgba(rgb, 0.35), width: 1, dash: 2 }));
+        const ts = k.filter((x) => x.time >= L.a.time && x.time <= tEnd).map((x) => x.time);
+        if (!ch.broken) ts.push(futEnd);
+        items.push({ t: "band", fill: rgba(rgb, 0.06), pts: ts.map((t) => { const b0 = Structure.lineAt(L, t); return { time: T(t), up: Math.max(b0, b0 + ch.offset), dn: Math.min(b0, b0 + ch.offset) }; }) });
+        // 锚点小圆点：哪几个高低点定义了这条通道
+        for (const sw of [L.a, L.b]) if (inChart(sw.time)) items.push({ t: "text", time: T(sw.time), price: sw.price, text: "●", pos: ch.offset > 0 ? "below" : "above", color: rgba(rgb, 0.9), size: 7, off: 2, prio: 7 });
       }
     }
     // 波浪
@@ -1084,7 +1087,8 @@ const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在�
     // 2. 趋势线：只画强线，不画已破的
     if (Ly.tl) {
       const tlLine = (L, color, label) => slopeLine(F, L, L.a.time, futEnd, { color, width: L.strong ? 2 : 1.3, dash: L.strong ? 0 : 1, label, lc: color, prio: 2 });
-      for (const L of Structure.keyTrendlines(S, { max: P.tl, fallback: P.tlFallback, nowTime: lastT }))
+      const chBase = Ly.ch && S.channel ? S.channel.base : null; // 通道下轨/上轨本身就是趋势线，不重复画
+      for (const L of Structure.keyTrendlines(S, { max: P.tl, fallback: P.tlFallback, nowTime: lastT }).filter((L) => !chBase || L.a.time !== chBase.a.time || L.b.time !== chBase.b.time))
         items.push(tlLine(L, L.side === "up" ? COL.up : COL.dn, `${L.touches}触${L.strong ? "" : "·候选"}`));
       if (P.htfTl) {
         const tf = HTF_OF[state.chartTf]?.[0], H = tf && structOf(sym, tf);
@@ -1441,11 +1445,9 @@ const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在�
       chDnS.setData(at.map(({ t, v }) => ({ time: T(t), value: v.dn })));
       // 15m 图上日线/4h 通道比可见范围大一个量级，填充会把整张图染掉 —— 15m 上不画填充
       if (!isLtf) items.push({ t: "band", fill: ch.slopeUp ? "rgba(0,217,255,.07)" : "rgba(255,110,110,.07)", pts: at.map(({ t, v }) => ({ time: T(t), up: v.up, dn: v.dn })) });
-      if (ch.from >= k[0].time) items.push({ t: "vline", time: T(snap(ch.from)), color: "rgba(0,217,255,.45)", label: narrowUi ? "" : `通道起点 · ${S0.label}${ch.n}根` });
-      // 当时实际的通道：每根K线收盘时用当时的 n 根拟合，取右端点。这才是历史上真实能看到的位置
-      const tr = k.map((x) => { const f = Levels.asOf(S0.fits, closeOf(x)); return f ? { time: T(x.time), ...Levels.evalFit(f, x.time) } : { time: T(x.time) }; });
-      trUpS.setData(tr.map((p) => (p.up != null ? { time: p.time, value: p.up } : { time: p.time })));
-      trDnS.setData(tr.map((p) => (p.dn != null ? { time: p.time, value: p.dn } : { time: p.time })));
+      // 图上只画"现在"的回归通道三条线（原来还有通道起点竖线 + 两条灰色"当时"轨迹，太乱）。
+      // "当时"通道的可靠性仍在右侧面板里给出（下一根落在带内的比例），见 structureFor
+      [trUpS, trDnS].forEach((x) => x.setData([]));
     } else {
       [chMidS, chUpS, chDnS, trUpS, trDnS].forEach((x) => x.setData([]));
     }
@@ -1738,8 +1740,8 @@ const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在�
         `<span class="muted small">下一根收盘落在通道内（${SP.oosN} 次）</span></div>` +
         `<div class="muted small" style="margin-top:4px">通道是对 log 收盘价做最小二乘回归（${cfg.label} ${ch.n} 根），不是手连的趋势线：结果唯一、可复现。` +
         `<b>图上亮青色的是"现在"的通道</b>，它是用这 ${ch.n} 根拟合出来的，所以历史K线看起来"刚好在轨道里反弹"——那是事后画线，当时并不存在。` +
-        `<b>灰色点线是"当时"的通道</b>（每根K线收盘时只用当时数据拟合），历史上真实能看到的是它。` +
-        `「可靠性」两个数的差距就是事后画线的错觉有多大。底部色带是每根K线当时的形态判定（绿=趋势↑ 红=趋势↓ 橙=震荡）。` +
+        `「可靠性·当时」= 每根K线收盘时只用当时数据拟合，下一根还落在带内的比例；和「事后看」的差距就是事后画线的错觉有多大。` +
+        `想看两条平行直线的手画式通道，用图层条里的「平行通道」。底部色带是每根K线当时的形态判定（绿=趋势↑ 红=趋势↓ 橙=震荡）。` +
         `<b>效率比</b>=净位移/路径总长，越接近 1 越单边。<b>这些阈值都没经过回测验证，不参与信号判定。</b>` +
         `${follow ? "" : "<br>当前主图是 15m，通道半宽 ±" + ch.bandPct.toFixed(0) + "% 远超 15m 的可见区间 —— 点图表左上角的「4h」或「日线」看完整通道。"}</div>`;
     } else {
@@ -1890,7 +1892,12 @@ const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在�
       const tls = [tlv(S.tl.up, "上升", "long"), tlv(S.tl.down, "下降", "short")].filter(Boolean);
       const brk = [S.tl.upBroken && "上升线刚被跌破", S.tl.downBroken && "下降线刚被突破"].filter(Boolean);
       rows.push(["趋势线", (tls.join(" · ") || '<span class="muted">无有效趋势线</span>') + (brk.length ? ` <span class="wait">${brk.join("，")}</span>` : "")]);
-      if (S.channel) rows.push(["通道", S.channel.base ? `${S.channel.kind} · 现价在 <b>${Math.round(S.channel.pos * 100)}%</b> <span class="muted">(0=下沿 100=上沿)</span>` : `<span class="wait">${S.channel.kind}</span> <span class="muted">两条趋势线同时有效</span>`]);
+      if (S.channel) {
+        const c = S.channel, b0 = Structure.lineAt(c.base, nowS), lo = Math.min(b0, b0 + c.offset), hi = Math.max(b0, b0 + c.offset);
+        rows.push(["通道", c.broken
+          ? `<span class="wait">${c.kind}已${c.breakUp ? "向上突破" : "向下跌破"}</span> <span class="muted">${fmtTime(c.breakTime)}</span>`
+          : `${c.kind} · 现价在 <b>${Math.round(c.pos * 100)}%</b> <span class="muted">(0=下沿 100=上沿)</span><br><span class="muted num">下沿 ${fmtPrice(lo)} · 上沿 ${fmtPrice(hi)} · 宽 ${c.widthAtr.toFixed(1)}ATR · ${c.touchesBase + c.touchesOpp} 次触碰</span>`]);
+      }
       const z = S.zs[S.zs.length - 1];
       if (z) rows.push(["中枢", `<b class="num">${fmtPrice(z.zd)} ~ ${fmtPrice(z.zg)}</b> <span class="muted">${z.n}笔 · 波动 ${fmtPrice(z.dd)}~${fmtPrice(z.gg)}${S.activeZs ? " · 仍在延伸" : ""}</span>`]);
       if (S.wave) {
