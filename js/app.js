@@ -5,6 +5,7 @@ import { Structure } from "./structure.js";
 import { StructStrat } from "./structstrat.js";
 import { Strategy } from "./strategy.js";
 import { Push } from "./push.js";
+import { computeAll } from "./compute.js";
 import { createApi, RateLimiter, KlineCache, syncKlines, loadOlder, upsertBar, mergeBars, TF_SEC } from "./data.js";
 const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在全局
 {
@@ -27,9 +28,7 @@ const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在�
   };
   const MARKET_NAMES = { crypto: "加密货币", us: "美股", kr: "韩股", hk: "港股", other: "其他" };
   const TZ = -new Date().getTimezoneOffset() * 60; // 图表显示本地时间
-  // 加密货币：信号K线主动成交偏向 ≥ 0.2（主动买入占成交量 ≥ 60%，空单反之）视为"过热追单"
-  // 6 个月 6 个币回测：这类信号每笔 -0.15R，其余 -0.02R，前后两半和 5/6 个币结论一致
-  const HOT_FLOW = 0.2;
+  // "过热追单"阈值 HOT_FLOW 见 compute.js（6 个月 6 个币回测：这类信号每笔 -0.15R，其余 -0.02R）
 
   // localStorage 前缀。本仓库（mtf 版）部署在 babakaifeiji-1.github.io 的另一个路径下，
   // 和原版 crypto_minitor 是**同一个 origin**，localStorage 是共用的。
@@ -39,6 +38,14 @@ const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在�
     load(key, def) { try { const v = JSON.parse(localStorage.getItem(STORE_PREFIX + key)); return v ?? def; } catch { return def; } },
     // 配额满（journal 太大）时不能让整个主循环抛异常
     save(key, v) { try { localStorage.setItem(STORE_PREFIX + key, JSON.stringify(v)); } catch (e) { console.warn("localStorage 写入失败", key, e); } },
+  };
+
+  // 主线程耗时统计（毫秒累计 / 次数），调试面板和端到端测试读 window.__mtf.prof
+  const prof = {};
+  const timed = (name, fn) => function (...a) {
+    const t0 = performance.now();
+    try { return fn.apply(this, a); }
+    finally { const p = (prof[name] ??= { ms: 0, n: 0, max: 0 }), dt = performance.now() - t0; p.ms += dt; p.n++; if (dt > p.max) p.max = dt; }
   };
 
   function initialSymbols() {
@@ -162,7 +169,7 @@ const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在�
   function makeData(sym) {
     const d = {
       sym, bars: { ltf: [], htf: [], h4: [], d1: [], m3: [] }, ver: { ltf: 0, htf: 0, h4: 0, d1: 0, m3: 0 },
-      res: null, live: null, dirty: true, computedAt: 0, persistDirty: new Set(), older: {},
+      res: null, live: null, dirty: true, computedAt: 0, persistDirty: new Set(), older: {}, wFull: new Set(),
       seen: new Map(), exitAlerted: new Set(), initialized: false,
     };
     // d.ltf / d.htf / ... = 计算窗口（最近 WIN 根），只在K线变化后重新切片
@@ -179,6 +186,7 @@ const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在�
     d.bars[key] = bars.length > MAX_BARS ? bars.slice(-MAX_BARS) : bars;
     d.ver[key]++;
     d.persistDirty.add(key);
+    d.wFull?.add(key);
   }
   async function fetchKlines(sym, interval, limit) { return api.klines(sym, interval, { limit }); }
 
@@ -231,7 +239,7 @@ const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在�
     try {
       const { bars, added } = await loadOlder(api, sym, IV[key], d.bars[key]);
       d.older[key] = added > 0 ? null : "end";
-      if (added > 0) { d.bars[key] = bars; d.ver[key]++; d.persistDirty.add(key); }
+      if (added > 0) { d.bars[key] = bars; d.ver[key]++; d.persistDirty.add(key); if (d.bars[key].length <= WIN[key]) d.wFull.add(key); }
       return added;
     } catch (e) {
       console.warn("往前加载失败", sym, key, e);
@@ -251,45 +259,66 @@ const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在�
   setInterval(flushCache, 30000);
   addEventListener("pagehide", flushCache);
 
-  function recompute(sym) {
+  // ── 重算：优先放进 Web Worker（js/worker.js），失败（老浏览器 / file:// 打开）时退回主线程同步算 ──
+  // Worker 里保存每个品种的计算窗口，这里只发增量：上次发过的最后一根及之后的K线；
+  // 窗口被整段换掉（加载 / 补缺口 / 往前翻页）后发整段（setBars 里标记 wFull）。
+  const CKEYS = ["ltf", "htf", "h4", "d1"];
+  let worker = null, wSeq = 0;
+  try {
+    worker = new Worker(new URL("./worker.js", import.meta.url), { type: "module" });
+    worker.onmessage = (e) => onWorkerReply(e.data);
+    worker.onerror = (e) => { console.warn("计算 Worker 出错，改为主线程计算", e.message); worker = null; for (const s0 of state.symbols) { const d = state.data[s0]; if (d) { d.inflight = false; d.wSent = {}; d.dirty = true; } } };
+  } catch (e) { console.warn("不支持 module Worker，改为主线程计算", e); worker = null; }
+
+  function recompute_raw(sym) {
     const d = state.data[sym];
     if (!d || d.ltf.length < 100) return;
-    // 额外把 4h / 日线喂进去：htfStop（高周期硬位止损）和 regimeGate 需要。
-    // 两者默认关闭，此时 Strategy 内部不会碰这两个数组，行为与原版一致。
-    d.res = Strategy.run(d.ltf, d.htf, LTF_SEC, { ...paramsFor(sym), h4k: d.h4, d1k: d.d1 });
     d.computedAt = Date.now();
-    // 大周期背景（只显示和统计，不影响信号）
-    d.ctx = { h4: Strategy.trendSeries(d.h4, 14400), d1: Strategy.trendSeries(d.d1, 86400) };
-    for (const sg of d.res.signals) {
-      const t = sg.time + LTF_SEC;
-      const a = Strategy.trendAt(d.ctx.d1, t), b = Strategy.trendAt(d.ctx.h4, t);
-      sg.d1 = a ? (a.st === sg.side ? "同向" : "逆向") : null;
-      sg.h4 = b ? (b.st === sg.side ? "同向" : "逆向") : null;
-      const hist = d.res.ind.macd.hist;
-      sg.mt = (hist[sg.i] - hist[sg.i - 1]) * sg.side > 0 ? "是" : "否"; // MACD 柱是否朝信号方向拐头
-      const bar = d.ltf[sg.i];
-      sg.flow = bar?.volume ? ((2 * bar.takerBuy) / bar.volume - 1) * sg.side : null; // >0 表示主动成交和信号同方向
-      sg.hot = marketOf(sym) === "crypto" && sg.flow >= HOT_FLOW;
-    }
-    recordJournal(sym, d.res.signals);
-    // 最近 300 根已收盘K线里的强价位拒绝
-    {
-      const k = d.ltf, ind = d.res.ind;
-      let last = k.length - 1;
-      if (k[last].time + LTF_SEC > Date.now() / 1000) last--;
-      d.rejections = [];
-      for (let i = Math.max(61, last - 300); i <= last; i++) {
-        const ev = Levels.rejection(d.res.levelsAt(i - 1), k, i, ind.atr[i - 1]);
-        if (ev) d.rejections.push(ev);
-      }
-    }
-    d.live = Strategy.liveState(d.res, d.ltf);
-    d.exit = Strategy.exitWarning(d.res, d.ltf);
-    const last = d.res.signals[d.res.signals.length - 1];
-    d.lastStatus = last ? Strategy.signalStatus(last, d.res, d.ltf, LTF_SEC) : null;
     d.dirty = false;
+    if (!worker) { applyResult(sym, computeAll({ ltf: d.ltf, htf: d.htf, h4: d.h4, d1: d.d1, ltfSec: LTF_SEC, params: paramsFor(sym) })); return; }
+    if (d.inflight) { d.pending = true; return; }
+    postCompute(sym);
+  }
+  function postCompute(sym) {
+    const d = state.data[sym];
+    d.wSent ??= {};
+    const bars = {};
+    for (const key of CKEYS) {
+      const all = d.bars[key];
+      if (!all.length) continue;
+      const lastT = d.wSent[key];
+      if (lastT == null || d.wFull.has(key)) bars[key] = { full: d[key] };
+      else {
+        let j = all.length - 1;
+        while (j > 0 && all[j].time > lastT) j--;
+        if (all[j].time !== lastT) { bars[key] = { full: d[key] }; }
+        else if (j < all.length - 1 || all[j] !== d.wSentBar?.[key]) bars[key] = { tail: all.slice(j) };
+      }
+      d.wSent[key] = all[all.length - 1].time;
+      (d.wSentBar ??= {})[key] = all[all.length - 1];
+    }
+    d.wFull.clear();
+    d.inflight = true;
+    worker.postMessage({ id: ++wSeq, sym, nowMs: Date.now(), ltfSec: LTF_SEC, params: paramsFor(sym), win: WIN, bars });
+  }
+  function onWorkerReply(r) {
+    const d = state.data[r.sym];
+    if (!d) return;
+    d.inflight = false;
+    if (r.need) { for (const k of r.need) d.wFull.add(k); postCompute(r.sym); return; }
+    if (r.error) { console.warn("Worker 计算失败", r.sym, r.error); d.wSent = {}; return; }
+    if (r.out) applyResult(r.sym, r.out);
+    if (d.pending) { d.pending = false; recompute(r.sym); }
+  }
+  function applyResult(sym, out) {
+    const d = state.data[sym];
+    if (!d || !out) return;
+    const first = !d.res;
+    Object.assign(d, { res: out.res, ctx: out.ctx, rejections: out.rejections, live: out.live, exit: out.exit, lastStatus: out.lastStatus, resFirst: out.firstTime });
+    recordJournal(sym, d.res.signals);
     checkAlerts(sym);
     checkSst(sym);
+    if (first && sym === state.active) renderAll();
   }
 
   // 本机信号日志：长期累积已平仓信号及其大周期分组，用于判断日线/4h过滤到底有没有用
@@ -1206,10 +1235,12 @@ const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在�
 
   // 当前价格上下最近的几个支撑压力位（用最后一根已收盘K线计算）
   function keyLevels(d, n = 3) {
-    const k = d.ltf, res = d.res;
+    const k = d.ltf, res = d.res, ln = res.levelsNow;
+    if (!ln) return { above: [], below: [], price: k[k.length - 1].close };
+    // 价位是 Worker 按"最后一根已收盘K线"算好带回来的；在当前窗口里按时间找到那一根
     let i = k.length - 1;
-    if (k[i].time + LTF_SEC > Date.now() / 1000) i--;
-    const lv = res.levelsAt(i), price = k[k.length - 1].close, atr = res.ind.atr[i];
+    while (i > 0 && k[i].time > ln.time) i--;
+    const lv = ln.levels, price = k[k.length - 1].close, atr = res.ind.atr[ln.i];
     const near = lv.filter((l) => Math.abs(l.price - price) <= 6 * atr);
     const above = near.filter((l) => l.price > price).sort((a, b) => a.price - b.price).slice(0, n);
     const below = near.filter((l) => l.price <= price).sort((a, b) => b.price - a.price).slice(0, n);
@@ -1247,7 +1278,7 @@ const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在�
       <span class="ohlc-extra"><span class="k">量</span>${vol}</span>`);
   }
 
-  function renderChart() {
+  function renderChart_raw() {
     const sym = state.active, d = state.data[sym];
     if (!d?.res) return;
     const T = (t) => t + TZ;
@@ -1266,7 +1297,7 @@ const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在�
     const vr0 = prepended ? chart.timeScale().getVisibleLogicalRange() : null;
     chartFirstT = k[0].time;
     // 15m 且图上K线和策略计算窗口一一对应时直接用策略的指标；否则现算（同样的 TA 函数、同样的参数）
-    const ind = isLtf && k.length === d.res.ind.c.length && k[0].time === d.ltf[0]?.time ? d.res.ind : (() => {
+    const ind = isLtf && k.length === d.res.ind.c.length && k[0].time === d.resFirst ? d.res.ind : (() => {
       const c = k.map((x) => x.close), h = k.map((x) => x.high), l = k.map((x) => x.low);
       return { ema9: TA.ema(c, 9), ema21: TA.ema(c, 21), st: TA.supertrend(h, l, c, 10, 3), atr: TA.atr(h, l, c, 14) };
     })();
@@ -1501,7 +1532,7 @@ const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在�
     return `<div class="badge ${ui.cls}">${txt}</div>`;
   }
 
-  function renderWatchlist() {
+  function renderWatchlist_raw() {
     let html = "", lastGroup = null;
     const order = { crypto: 0, us: 1, kr: 2, hk: 3, other: 4 };
     const syms = [...state.symbols].sort((a, b) => (order[marketOf(a)] ?? 9) - (order[marketOf(b)] ?? 9));
@@ -1570,7 +1601,7 @@ const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在�
     }
   }
 
-  function renderSide() {
+  function renderSide_raw() {
     const sym = state.active, d = state.data[sym];
     const sess = sessionOf(sym);
     const lg = (c, t) => `<span><i style="background:${c}"></i>${t}</span>`;
@@ -1809,7 +1840,7 @@ const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在�
   }
 
   // 价格结构面板：五个周期一览 + 当前主图周期的细节 + 多周期共振提示
-  function renderStructPanel() {
+  function renderStructPanel_raw() {
     const sym = state.active, d = state.data[sym];
     if (!d?.ltf?.length) { setHtml("structPanel", '<span class="muted small">加载中…</span>'); return; }
     const isS = isShort(), main = state.chartTf;
@@ -2067,6 +2098,7 @@ const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在�
     if (state.symbols.length <= 1) return;
     state.symbols = state.symbols.filter((s) => s !== sym);
     delete state.data[sym];
+    worker?.postMessage({ sym, drop: true });
     store.save("symbols", state.symbols);
     store.save("symbolsVer", SYMBOLS_VER);
     if (state.active === sym) state.active = state.symbols[0];
@@ -2082,7 +2114,7 @@ const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在�
 
   // ---------------- 启动 ----------------
   async function main() {
-    window.__mtf = { state, api, chart: () => chart, loadOlderBars, flushCache }; // 调试/端到端测试用的只读入口
+    window.__mtf = { state, api, chart: () => chart, loadOlderBars, flushCache, prof }; // 调试/端到端测试用的只读入口
     initChart();
     bindUi();
     syncChartTfBtns();
@@ -2145,6 +2177,13 @@ const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在�
       }
     }, 1000);
   }
+
+  // 热点函数计时（见 prof）
+  const recompute = timed("recompute", recompute_raw);
+  const renderChart = timed("renderChart", renderChart_raw);
+  const renderWatchlist = timed("renderWatchlist", renderWatchlist_raw);
+  const renderSide = timed("renderSide", renderSide_raw);
+  const renderStructPanel = timed("renderStructPanel", renderStructPanel_raw);
 
   main();
 }

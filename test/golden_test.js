@@ -72,5 +72,26 @@ for (const g of G.regimeFits) {
   }
   T.ok(!bad, `${g.sym} regimeFits(${g.sec}) ${bad}`);
 }
+// 全量对拍：每一个滚动结果都和"逐窗口重新算"（Levels.channel / Levels.regime）比较
+{
+  const rel = (a, b) => Math.abs(a - b) / Math.max(1e-12, Math.abs(b));
+  let worst = 0, nChk = 0, badR = 0;
+  for (const sym of ['BTCUSDT', 'SOLUSDT']) for (const [key, n, sec] of [['h4', 360, 14400], ['d1', 120, 86400], ['h', 360, 3600]]) {
+    const k = get(sym)[key];
+    for (const f of Levels.channelFits(k, n, sec)) {
+      const w = k.slice(f.i - n + 1, f.i + 1), ch = Levels.channel(w, n), t = k[f.i].time;
+      const v = Levels.evalFit(f, t), u = ch.lineAt(t);
+      worst = Math.max(worst, rel(v.mid, u.mid), rel(v.up, u.up), rel(v.dn, u.dn), Math.abs(f.r2 - ch.r2));
+      nChk++;
+    }
+    for (const r of Levels.regimeFits(k, 90, sec, 0.35)) {
+      const q = Levels.regime(k.slice(r.i - 89, r.i + 1), 90, 0.35);
+      if (q.er !== r.er || q.trending !== r.trending || q.hi !== r.hi || q.lo !== r.lo || q.up !== r.up || q.widthPct !== r.widthPct) badR++;
+    }
+  }
+  T.ok(worst < 1e-9, `channelFits 滚动 vs 逐窗：最大误差 ${worst}`);
+  T.ok(badR === 0, `regimeFits 滚动 vs 逐窗：${badR} 个不一致`);
+  console.log(`  全量对拍 ${nChk} 个通道，最大相对误差 ${worst.toExponential(1)}`);
+}
 console.log(`  channelFits+regimeFits 合计 ${tFit.toFixed(0)} ms（${G.channelFits.length + G.regimeFits.length} 组）`);
 T.done();

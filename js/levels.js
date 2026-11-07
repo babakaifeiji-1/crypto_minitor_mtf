@@ -257,21 +257,65 @@ export const Levels = (() => {
   // 下面两个函数在第 i 根收盘时只用 [i-n+1, i] 这 n 根，validFrom = 这根的收盘时刻，
   // 表示"从这一刻起才知道这个结果"。任何周期的图表上，某根K线收盘时能看到的，
   // 就是 validFrom ≤ 该收盘时刻的最后一个结果。
+  // 滚动版：窗口每右移一根，只加一项、减一项（原来每根都重新拟合 n 根，O(N·n)）。
+  // 结果和逐窗 fitLog 一致（相对误差 < 1e-9，test/golden_test.js 对拍）：
+  //   * x 用全局原点（第一根），斜率与原点无关；截距按窗口原点 t0 换算回来
+  //   * y 减去全局参考值，避免 Σy² 很大时相减丢精度
+  //   * 每 64 步从头精确重算一次，防止累加误差漂移
   function channelFits(k, n, barSec) {
     const out = [];
-    if (!k || k.length < n) return out;
+    if (!k || k.length < n || n < 10) return out;
+    const T0 = k[0].time, Y0 = Math.log(k[0].close);
+    const X = new Float64Array(k.length), Y = new Float64Array(k.length);
+    for (let i = 0; i < k.length; i++) { X[i] = (k[i].time - T0) / 86400; Y[i] = Math.log(k[i].close) - Y0; }
+    let sx = 0, sy = 0, sxx = 0, sxy = 0, syy = 0;
+    const exact = (lo, hi) => { sx = sy = sxx = sxy = syy = 0; for (let j = lo; j <= hi; j++) { sx += X[j]; sy += Y[j]; sxx += X[j] * X[j]; sxy += X[j] * Y[j]; syy += Y[j] * Y[j]; } };
     for (let i = n - 1; i < k.length; i++) {
-      const f = fitLog(k.slice(i - n + 1, i + 1));
-      if (f) out.push({ ...f, validFrom: k[i].time + barSec, i });
+      const lo = i - n + 1;
+      if (i === n - 1 || (i - n + 1) % 64 === 0) exact(lo, i);
+      else {
+        const a = lo - 1;
+        sx += X[i] - X[a]; sy += Y[i] - Y[a];
+        sxx += X[i] * X[i] - X[a] * X[a]; sxy += X[i] * Y[i] - X[a] * Y[a]; syy += Y[i] * Y[i] - Y[a] * Y[a];
+      }
+      const xm = sx / n, ym = sy / n;
+      const Sxx = sxx - n * xm * xm, Sxy = sxy - n * xm * ym, Syy = syy - n * ym * ym;
+      if (!(Sxx > 1e-12 * Math.max(1, sxx))) continue;
+      const bb = Sxy / Sxx;
+      const xw = X[lo]; // 窗口原点（天）
+      const aa = ym + Y0 - bb * (xm - xw);
+      const ssr = Math.max(0, Syy - bb * Sxy);
+      out.push({
+        t0: k[lo].time, a: aa, b: bb, sigma: Math.sqrt(ssr / Math.max(1, n - 2)), r2: Syy > 0 ? 1 - ssr / Syy : 0,
+        from: k[lo].time, to: k[i].time, n, validFrom: k[i].time + barSec, i,
+      });
     }
     return out;
   }
+  // 滚动版 regime：路径长度用前缀和，最高/最低用单调队列，O(N)
   function regimeFits(k, n, barSec, erThreshold = 0.35) {
     const out = [];
-    if (!k || k.length < n) return out;
-    for (let i = n - 1; i < k.length; i++) {
-      const r = regime(k.slice(i - n + 1, i + 1), n, erThreshold);
-      if (r) out.push({ ...r, validFrom: k[i].time + barSec, i });
+    if (!k || k.length < n || n < 10) return out;
+    const P = new Float64Array(k.length); // P[i] = Σ_{j≤i} |c_j - c_{j-1}|
+    for (let i = 1; i < k.length; i++) P[i] = P[i - 1] + Math.abs(k[i].close - k[i - 1].close);
+    const qh = [], ql = []; let hh = 0, hl = 0; // 下标队列（头指针 hh/hl）
+    for (let i = 0; i < k.length; i++) {
+      while (qh.length > hh && k[qh[qh.length - 1]].high <= k[i].high) qh.pop();
+      qh.push(i);
+      while (ql.length > hl && k[ql[ql.length - 1]].low >= k[i].low) ql.pop();
+      ql.push(i);
+      if (i < n - 1) continue;
+      const lo = i - n + 1;
+      while (qh[hh] < lo) hh++;
+      while (ql[hl] < lo) hl++;
+      // 和 regime() 同样的加法顺序算路径，保证 er 与阈值比较的结果逐位一致
+      let path = 0;
+      if (n <= 200) for (let j = lo + 1; j <= i; j++) path += Math.abs(k[j].close - k[j - 1].close);
+      else path = P[i] - P[lo];
+      const net = Math.abs(k[i].close - k[lo].close);
+      const er = path > 0 ? net / path : 0;
+      const hi = k[qh[hh]].high, low = k[ql[hl]].low, mid = (hi + low) / 2;
+      out.push({ er, trending: er >= erThreshold, hi, lo: low, mid, widthPct: mid > 0 ? (hi - low) / mid * 100 : 0, up: k[i].close > k[lo].close, n, validFrom: k[i].time + barSec, i });
     }
     return out;
   }
