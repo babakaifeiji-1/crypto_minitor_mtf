@@ -5,6 +5,7 @@ import { Structure } from "./structure.js";
 import { StructStrat } from "./structstrat.js";
 import { Strategy } from "./strategy.js";
 import { Push } from "./push.js";
+import { createApi, RateLimiter, KlineCache, syncKlines, loadOlder, upsertBar, mergeBars, TF_SEC } from "./data.js";
 const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在全局
 {
   const LTF = "15m", HTF = "1h";
@@ -36,7 +37,8 @@ const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在�
   const STORE_PREFIX = "mtf_";
   const store = {
     load(key, def) { try { const v = JSON.parse(localStorage.getItem(STORE_PREFIX + key)); return v ?? def; } catch { return def; } },
-    save(key, v) { localStorage.setItem(STORE_PREFIX + key, JSON.stringify(v)); },
+    // 配额满（journal 太大）时不能让整个主循环抛异常
+    save(key, v) { try { localStorage.setItem(STORE_PREFIX + key, JSON.stringify(v)); } catch (e) { console.warn("localStorage 写入失败", key, e); } },
   };
 
   function initialSymbols() {
@@ -144,15 +146,41 @@ const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在�
   }
 
   // ---------------- 数据 ----------------
-  async function fetchJson(path) {
-    const r = await fetch(REST + path);
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    return r.json();
+  // REST 全部经过限频器（自记账，预算为币安上限的一半）；网络错误 / 5xx 重试，429/418 整体暂停
+  const api = createApi({
+    base: REST, limiter: new RateLimiter({ budget: 1200 }),
+    onThrottle: (status, ms) => { console.warn(`币安限频 ${status}，暂停 ${ms / 1000}s`); setConn("wait", `限频暂停 ${Math.round(ms / 1000)}s`); },
+  });
+  const fetchJson = (path) => api.get(path);
+  // 每个品种每个周期一份完整K线（显示用，可往前无限翻页）；策略/结构只用最近 WIN 根（计算窗口），
+  // 窗口大小 = 原版每个周期的拉取根数，保证信号和原版一致（test/golden_test.js）
+  const IV = { ltf: LTF, htf: HTF, h4: "4h", d1: "1d", m3: "3m" };
+  const KEY_OF = Object.fromEntries(Object.entries(IV).map(([k, v]) => [v, k]));
+  const WIN = { ltf: 1500, htf: 500, h4: 1000, d1: 500, m3: 1000 };
+  const MAX_BARS = 200000; // 内存里单个周期最多保留多少根（往前翻页的上限）
+  const kcache = new KlineCache("mtf_klines", 10000);
+  function makeData(sym) {
+    const d = {
+      sym, bars: { ltf: [], htf: [], h4: [], d1: [], m3: [] }, ver: { ltf: 0, htf: 0, h4: 0, d1: 0, m3: 0 },
+      res: null, live: null, dirty: true, computedAt: 0, persistDirty: new Set(), older: {},
+      seen: new Map(), exitAlerted: new Set(), initialized: false,
+    };
+    // d.ltf / d.htf / ... = 计算窗口（最近 WIN 根），只在K线变化后重新切片
+    for (const key of Object.keys(WIN)) {
+      let cv = -1, cs = [];
+      Object.defineProperty(d, key, {
+        enumerable: true,
+        get() { if (cv !== d.ver[key]) { const a = d.bars[key]; cs = a.length > WIN[key] ? a.slice(-WIN[key]) : a.slice(); cv = d.ver[key]; } return cs; },
+      });
+    }
+    return d;
   }
-  async function fetchKlines(sym, interval, limit) {
-    const arr = await fetchJson(`/fapi/v1/klines?symbol=${sym}&interval=${interval}&limit=${limit}`);
-    return arr.map((x) => ({ time: x[0] / 1000, open: +x[1], high: +x[2], low: +x[3], close: +x[4], volume: +x[5], takerBuy: +x[9] }));
+  function setBars(d, key, bars) {
+    d.bars[key] = bars.length > MAX_BARS ? bars.slice(-MAX_BARS) : bars;
+    d.ver[key]++;
+    d.persistDirty.add(key);
   }
+  async function fetchKlines(sym, interval, limit) { return api.klines(sym, interval, { limit }); }
 
   // 合约类型（加密 / 美股 / 韩股…），以及美股成交量排行
   async function loadMeta() {
@@ -176,20 +204,52 @@ const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在�
     }
   }
 
+  // 加载 / 补齐一个品种的全部周期：先读 IndexedDB 缓存，再只补缓存之后缺的K线（重连补缺口也走这里）。
+  // 已有的 state.data[sym] 原地更新 —— 持仓量、提醒去重这些状态不会因为重连丢掉
   async function loadSymbol(sym) {
-    const [ltf, htf, h4, d1, m3] = await Promise.all([
-      // 4h/日线拉得比原版多：通道拟合窗口拉长到 4h 360 根 / 日线 120 根，还要留出余量
-      fetchKlines(sym, LTF, 1500), fetchKlines(sym, HTF, 500), fetchKlines(sym, "4h", 1000), fetchKlines(sym, "1d", 500),
-      // 3m 只用于短线副图（入场确认），不参与策略。失败不影响其它
-      fetchKlines(sym, "3m", 1000).catch(() => []), // 3m 只用于画图（短线入场），不参与策略
-    ]);
-    const prev = state.data[sym];
-    state.data[sym] = {
-      ltf, htf, h4, d1, m3, res: null, live: null, dirty: true, computedAt: 0,
-      seen: prev?.seen ?? new Map(), exitAlerted: prev?.exitAlerted ?? new Set(), initialized: prev?.initialized ?? false,
+    const d = (state.data[sym] ??= makeData(sym));
+    const one = async (key) => {
+      const iv = IV[key];
+      const cached = d.bars[key].length ? d.bars[key] : await kcache.get(`${sym}|${iv}`);
+      const bars = await syncKlines(api, sym, iv, { win: WIN[key], cached });
+      if (bars.length) setBars(d, key, bars);
     };
+    // 15m / 1h 是策略必需的，失败就算加载失败；4h / 日线 / 3m 失败只影响对应的图层
+    const r = await Promise.allSettled(Object.keys(WIN).map(one));
+    const need = r.slice(0, 2).find((x) => x.status === "rejected");
+    if (need && !d.ltf.length) throw need.reason;
+    r.slice(2).forEach((x, i) => x.status === "rejected" && console.warn("K线加载失败", sym, Object.keys(WIN)[i + 2], x.reason));
+    d.error = null;
+    d.dirty = true;
     recompute(sym);
   }
+  // 往前翻一页（图表拖到最左边）。同一周期同时只有一个请求；到头了记下来不再请求
+  async function loadOlderBars(sym, key) {
+    const d = state.data[sym];
+    if (!d || d.older[key] === "busy" || d.older[key] === "end" || !d.bars[key].length) return 0;
+    d.older[key] = "busy";
+    try {
+      const { bars, added } = await loadOlder(api, sym, IV[key], d.bars[key]);
+      d.older[key] = added > 0 ? null : "end";
+      if (added > 0) { d.bars[key] = bars; d.ver[key]++; d.persistDirty.add(key); }
+      return added;
+    } catch (e) {
+      console.warn("往前加载失败", sym, key, e);
+      d.older[key] = null;
+      return 0;
+    }
+  }
+  // K线缓存写回：攒着每 30 秒写一次，页面关闭前再写一次
+  function flushCache() {
+    for (const sym of state.symbols) {
+      const d = state.data[sym];
+      if (!d?.persistDirty?.size) continue;
+      for (const key of d.persistDirty) kcache.put(`${sym}|${IV[key]}`, d.bars[key]);
+      d.persistDirty.clear();
+    }
+  }
+  setInterval(flushCache, 30000);
+  addEventListener("pagehide", flushCache);
 
   function recompute(sym) {
     const d = state.data[sym];
@@ -327,12 +387,6 @@ const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在�
     return txt;
   }
 
-  function upsertCandle(arr, c) {
-    const last = arr[arr.length - 1];
-    if (last && last.time === c.time) arr[arr.length - 1] = c;
-    else if (!last || c.time > last.time) { arr.push(c); if (arr.length > 1600) arr.shift(); }
-  }
-
   // ---------------- 提醒 ----------------
   function checkAlerts(sym) {
     const d = state.data[sym];
@@ -467,48 +521,83 @@ const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在�
   }
 
   // ---------------- WebSocket ----------------
-  let ws = null, wsUrlIdx = 0, wsRetry = 0, wsTimer = null, lastMsgAt = 0, downSince = 0;
+  // 稳定性：
+  //   * 看门狗：连上后 40 秒没有任何K线推送（连接"活着"但不出数据）就主动断开重连；20 秒连不上也重连
+  //   * 每次（重新）收到第一条数据后，用 REST 从每个周期最后一根往后补 —— 覆盖 REST 拉完到 WS 连上之间、
+  //     以及断线期间漏掉的K线（含那根收盘时的最终值）。补齐是增量的，只请求缺的几根
+  //   * 推送里发现跳了K线（gap）也触发补齐
+  let ws = null, wsUrlIdx = 0, wsRetry = 0, wsTimer = null, lastMsgAt = 0, downSince = 0, wsOpenedAt = 0, wsGotData = false;
+  const WS_STALL_MS = 40000, WS_CONNECT_MS = 20000;
+  const gapBusy = new Set();
+  async function fillGaps(syms) {
+    await Promise.allSettled(syms.map(async (sym) => {
+      if (gapBusy.has(sym) || !state.data[sym]) return;
+      gapBusy.add(sym);
+      try { await loadSymbol(sym); } finally { gapBusy.delete(sym); }
+    }));
+  }
+  // 推送跳过了K线：把 (prevT, t) 之间缺的补上
+  async function fillGap(sym, key, prevT, t) {
+    const d = state.data[sym], sec = TF_SEC[IV[key]];
+    try {
+      const got = await api.klines(sym, IV[key], { limit: Math.min(1500, Math.round((t - prevT) / sec) + 1), startTime: prevT * 1000, endTime: t * 1000 - 1 });
+      if (!got.length) return;
+      setBars(d, key, mergeBars(got, d.bars[key])); // 已有的（含刚推来的最新一根）优先
+      d.dirty = true;
+    } catch (e) { console.warn("补缺口失败", sym, key, e); }
+  }
   function connectWs() {
-    if (ws) { ws.onclose = null; ws.close(); }
+    if (ws) { ws.onclose = null; ws.onmessage = null; try { ws.close(); } catch { /* 已关 */ } }
+    clearTimeout(wsTimer);
     const streams = state.symbols.flatMap((s) => [LTF, HTF, "4h", "1d", "3m"].map((iv) => `${s.toLowerCase()}@kline_${iv}`)).join("/");
     const url = `${WS_URLS[wsUrlIdx]}?streams=${streams}`;
     setConn("wait", "连接中");
-    ws = new WebSocket(url);
-    let gotData = false;
-    ws.onmessage = (ev) => {
-      if (!gotData) {
-        gotData = true; wsRetry = 0; setConn("ok", "实时");
+    const sock = (ws = new WebSocket(url));
+    wsOpenedAt = Date.now(); wsGotData = false;
+    sock.onmessage = (ev) => {
+      lastMsgAt = Date.now();
+      if (!wsGotData) {
+        wsGotData = true; wsRetry = 0; setConn("ok", "实时");
         if (downSince && Date.now() - downSince > 3 * 60000) {
           const mins = Math.round((Date.now() - downSince) / 60000);
           notify({ kind: "exit", event: "health", sym: state.active, title: "盯盘中断后已恢复", body: `行情连接中断了约 ${mins} 分钟，期间可能漏掉信号，请留意持仓。`, feed: `<b class="wait">连接恢复</b> 中断 ${mins} 分钟` });
         }
         downSince = 0;
+        fillGaps(state.symbols); // 补齐连上之前漏掉的K线
       }
-      const msg = JSON.parse(ev.data);
+      let msg;
+      try { msg = JSON.parse(ev.data); } catch { return; }
       const k = msg.data?.k;
       if (!k) return;
-      const d = state.data[k.s];
-      if (!d) return;
+      const d = state.data[k.s], key = KEY_OF[k.i];
+      if (!d || !key) return;
       const c = { time: k.t / 1000, open: +k.o, high: +k.h, low: +k.l, close: +k.c, volume: +k.v, takerBuy: +k.V };
-      lastMsgAt = Date.now();
-      const arr = { [LTF]: d.ltf, [HTF]: d.htf, "4h": d.h4, "1d": d.d1, "3m": d.m3 }[k.i];
-      if (arr) upsertCandle(arr, c);
-      if (k.i === "3m") return; // 3m 只用于画图，不触发策略重算
+      const arr = d.bars[key], prevT = arr[arr.length - 1]?.time;
+      const r = upsertBar(arr, c, TF_SEC[k.i]);
+      if (r === "old") return;
+      d.ver[key]++;
+      d.persistDirty.add(key);
+      if (r === "gap") fillGap(k.s, key, prevT, c.time);
+      if (key === "m3") return; // 3m 只用于画图，不触发策略重算
       d.dirty = true;
       if (k.x) recompute(k.s); // K线收盘立刻计算信号
     };
-    ws.onclose = () => {
+    sock.onclose = () => {
+      if (sock !== ws) return;
       setConn("bad", "断线重连中");
       if (!downSince) downSince = lastMsgAt || Date.now();
-      if (!gotData) wsUrlIdx = (wsUrlIdx + 1) % WS_URLS.length; // 换备用地址
+      if (!wsGotData) wsUrlIdx = (wsUrlIdx + 1) % WS_URLS.length; // 换备用地址
       clearTimeout(wsTimer);
-      wsTimer = setTimeout(async () => {
-        await Promise.allSettled(state.symbols.map(loadSymbol)); // 补齐断线期间的K线
-        connectWs();
-      }, Math.min(30000, 2000 * 2 ** wsRetry++));
+      wsTimer = setTimeout(connectWs, Math.min(30000, 2000 * 2 ** wsRetry++));
     };
-    ws.onerror = () => ws.close();
+    sock.onerror = () => { try { sock.close(); } catch { /* 已关 */ } };
   }
+  setInterval(() => {
+    if (!ws) return;
+    const now = Date.now();
+    const stalled = wsGotData ? now - lastMsgAt > WS_STALL_MS : now - wsOpenedAt > WS_CONNECT_MS;
+    if (stalled) { console.warn("行情推送停了，重连"); const s0 = ws; s0.onclose?.(); s0.onclose = null; try { s0.close(); } catch { /* 已关 */ } }
+  }, 5000);
   function setConn(cls, txt) {
     $("conn").className = `conn ${cls}`;
     $("conn").querySelector("span").textContent = txt;
@@ -1037,6 +1126,12 @@ const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在�
       timeScale: { borderColor: "#262d3b", timeVisible: true, secondsVisible: false, rightOffset: 8 },
       autoSize: true,
     });
+    // 无限往前：可视范围左边离第一根不到 30 根时，往前翻一页（1500 根），视图位置保持不动（见 renderChart）
+    chart.timeScale().subscribeVisibleLogicalRangeChange((r) => {
+      if (!r || r.from > 30) return;
+      const sym = state.active, key = (CHART_TF[state.chartTf] ?? CHART_TF["15m"]).key;
+      loadOlderBars(sym, key).then((added) => { if (added && sym === state.active) renderChart(); });
+    });
     candle = chart.addCandlestickSeries({ upColor: "#26a69a", downColor: "#ef5350", borderVisible: false, wickUpColor: "#26a69a", wickDownColor: "#ef5350" });
     candle.attachPrimitive(fillLayer);  // 填充画在K线下面
     candle.attachPrimitive(lineLayer);  // 框线、价位线段画在上面
@@ -1045,7 +1140,11 @@ const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在�
       const d = state.data[state.active];
       if (!d?.ltf?.length) return;
       const bars = chartBars?.length ? chartBars : d.ltf;
-      hoverIdx = param.time != null ? bars.findIndex((x) => x.time + TZ === param.time) : -1;
+      hoverIdx = -1;
+      if (param.time != null) { // 二分（往前翻页后可能有几万根）
+        let lo = 0, hi = bars.length - 1;
+        while (lo <= hi) { const m = (lo + hi) >> 1, t = bars[m].time + TZ; if (t === param.time) { hoverIdx = m; break; } if (t < param.time) lo = m + 1; else hi = m - 1; }
+      }
       renderOhlc();
     });
     vol = chart.addHistogramSeries({ priceScaleId: "vol", priceFormat: { type: "volume" }, lastValueVisible: false, priceLineVisible: false });
@@ -1118,11 +1217,12 @@ const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在�
     return { above, below, price };
   }
 
-  let chartSym = null, chartKey = "";
+  let chartSym = null, chartKey = "", chartFirstT = null;
+  const lowerBound = (k, t) => { let lo = 0, hi = k.length; while (lo < hi) { const m = (lo + hi) >> 1; if (k[m].time < t) lo = m + 1; else hi = m; } return lo; };
   const chartKeyOf = (d) => {
     const last = d.res.signals[d.res.signals.length - 1];
-    const hk = d[(CHART_TF[state.chartTf] ?? CHART_TF["15m"]).key] ?? [];
-    return `${state.active}|${state.chartTf}|${d.ltf.length}|${hk[hk.length - 1]?.time}|${d.res.signals.length}|${last?.result}|${last?.trailSl}|${d.lastStatus?.code}`;
+    const hk = d.bars[(CHART_TF[state.chartTf] ?? CHART_TF["15m"]).key] ?? [];
+    return `${state.active}|${state.chartTf}|${d.ltf.length}|${hk.length}|${hk[0]?.time}|${hk[hk.length - 1]?.time}|${d.res.signals.length}|${last?.result}|${last?.trailSl}|${d.lastStatus?.code}`;
   };
 
   // K线信息条：开高低收、涨跌幅（相对上一根收盘）、振幅（最高最低差 / 上一根收盘）
@@ -1157,10 +1257,16 @@ const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在�
     const narrowUi = matchMedia("(max-width: 900px)").matches; // 窄屏缩短价格线标签
     // 显示包含正在形成的那根（原来高周期图把它滤掉了，日线图上看不到今天）。
     // 通道/区间/形态只用已收盘K线算，见 structureFor
-    const k = d[ctf.key] ?? [];
+    // 图上画完整K线（可往前翻页，比计算窗口长）；策略/结构仍只用计算窗口 d.ltf 等
+    const k = d.bars[ctf.key] ?? [];
     if (!k.length) return;
-    // 15m 用策略已算好的指标；高周期现算（同样的 TA 函数、同样的参数）
-    const ind = isLtf ? d.res.ind : (() => {
+    // 往前翻页后K线变多了：记下前插了几根，setData 之后把可视范围同样平移，画面不跳
+    const viewKey = sym + "|" + state.chartTf;
+    const prepended = chartSym === viewKey && chartFirstT != null && k[0].time < chartFirstT ? lowerBound(k, chartFirstT) : 0;
+    const vr0 = prepended ? chart.timeScale().getVisibleLogicalRange() : null;
+    chartFirstT = k[0].time;
+    // 15m 且图上K线和策略计算窗口一一对应时直接用策略的指标；否则现算（同样的 TA 函数、同样的参数）
+    const ind = isLtf && k.length === d.res.ind.c.length && k[0].time === d.ltf[0]?.time ? d.res.ind : (() => {
       const c = k.map((x) => x.close), h = k.map((x) => x.high), l = k.map((x) => x.low);
       return { ema9: TA.ema(c, 9), ema21: TA.ema(c, 21), st: TA.supertrend(h, l, c, 10, 3), atr: TA.atr(h, l, c, 14) };
     })();
@@ -1351,6 +1457,7 @@ const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在�
       add(last.tp1, "#26a69a", "TP1(持仓者)", 2);
     }
 
+    if (vr0) chart.timeScale().setVisibleLogicalRange({ from: vr0.from + prepended, to: vr0.to + prepended });
     if (chartSym !== sym + "|" + state.chartTf) {
       const narrow = matchMedia("(max-width: 900px)").matches;
       const bars = Math.min(k.length, narrow ? Math.round(ctf.bars / 2) : ctf.bars);
@@ -1975,6 +2082,7 @@ const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在�
 
   // ---------------- 启动 ----------------
   async function main() {
+    window.__mtf = { state, api, chart: () => chart, loadOlderBars, flushCache }; // 调试/端到端测试用的只读入口
     initChart();
     bindUi();
     syncChartTfBtns();
@@ -1990,7 +2098,7 @@ const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在�
     await loadMeta();
     renderAll();
     await Promise.all(state.symbols.map((s) => loadSymbol(s).catch((err) => {
-      state.data[s] = { ltf: [], htf: [], error: `加载失败：${err.message}` };
+      (state.data[s] ??= makeData(s)).error = `加载失败：${err.message}`;
     })));
     renderAll();
     connectWs();
@@ -2029,7 +2137,7 @@ const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在�
       else {
         // 只更新最后一根，避免整图重绘。必须按当前主图周期取 —— 原来固定用 15m，
         // 切到日线图后每秒都会把一根 15m 时间戳的K线塞进日线图里
-        const arr = d[(CHART_TF[state.chartTf] ?? CHART_TF["15m"]).key] ?? d.ltf;
+        const arr = d.bars[(CHART_TF[state.chartTf] ?? CHART_TF["15m"]).key] ?? d.ltf;
         const x = arr[arr.length - 1], T = x.time + TZ;
         candle.update({ time: T, open: x.open, high: x.high, low: x.low, close: x.close });
         renderOhlc();
