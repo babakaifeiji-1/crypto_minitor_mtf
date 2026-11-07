@@ -6,6 +6,7 @@ import { StructStrat } from "./structstrat.js";
 import { Strategy } from "./strategy.js";
 import { Push } from "./push.js";
 import { computeAll } from "./compute.js";
+import { Setups } from "./setups.js";
 import { createApi, RateLimiter, KlineCache, syncKlines, loadOlder, upsertBar, mergeBars, TF_SEC } from "./data.js";
 const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在全局
 {
@@ -70,6 +71,8 @@ const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在�
     { id: "zs", name: "中枢", color: "rgba(255,170,40,.95)", tip: "缠论笔中枢：至少 3 笔重叠的区间 [ZD, ZG]，就是震荡区间" },
     { id: "wave", name: "波浪", color: "#00d9ff", tip: "推动浪/ABC 候选：只保留满足三条铁律、斐波那契比例最贴近的一组" },
     { id: "bos", name: "BOS/CHoCH", color: "#f5c542", tip: "BOS = 顺势突破前高/前低；CHoCH = 逆势突破，结构可能转变" },
+    { id: "setup", name: "形态ABC", color: "#e6c84f", tip: "A 扫流动性收回 / B 区间高抛低吸 / C 顺势回调：图上标出触发点，最近一笔画入场/止损/TP1/TP2，区间框。回测见右侧「交易形态」面板（均未通过，不推送）" },
+    { id: "liq", name: "流动性", color: "rgba(230,200,79,.6)", tip: "离现价最近、还没被扫的等高/等低/前高前低/昨日高低（每侧 1 个），以及最近未回补的 FVG（每侧 1 个）" },
     { id: "sig", name: "信号", color: "#c9d1e0", tip: "策略信号、止损/TP1、趋势转弱、🧱 强价位被拒" },
     { id: "sst", name: "结构信号", color: "#ff9f43", tip: "新的结构策略（1h 出信号、4h 定方向）：顺 4h 结构的 1h BOS/CHoCH。在 1h/15m 图上显示，回测见右侧「价格结构」面板" },
     { id: "ma", name: "均线", color: "#f5c542", tip: "EMA9 / EMA21 / Supertrend" },
@@ -77,7 +80,7 @@ const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在�
     { id: "reg", name: "回归通道", color: "rgba(0,217,255,.95)", tip: "旧版：log 收盘价回归通道 + 底部形态色带 + Donchian 震荡框" },
   ];
   // clean = 精简模式（每个周期只画重要的线，见 CLEAN），不是一个图层，单独一个开关
-  const LAYER_DEFAULT = { clean: 1, ch: 1, swing: 0, zone: 1, htf: 1, tl: 1, zs: 1, wave: 0, bos: 0, sig: 1, sst: 1, ma: 0, old: 0, reg: 0 };
+  const LAYER_DEFAULT = { clean: 1, ch: 1, setup: 1, liq: 0, swing: 0, zone: 1, htf: 1, tl: 1, zs: 1, wave: 0, bos: 0, sig: 1, sst: 1, ma: 0, old: 0, reg: 0 };
   const LAYER_PRESETS = {
     简洁: { zone: 1, htf: 1, tl: 1, ch: 1, sig: 1, sst: 1 },
     结构: { swing: 1, zone: 1, htf: 1, tl: 1, ch: 1, zs: 1, bos: 1, sig: 1, sst: 1 },
@@ -96,10 +99,10 @@ const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在�
     flashUntil: {}, // sym -> 时间戳，卡片闪烁
     chTf: store.load("chTf", "1d"), // 15m 图上「趋势通道」面板的周期档位："1d" 或 "4h"
     chartTf: store.load("chartTf", "15m"), // 主图周期："3m" / "15m"（短线）/ "1h" / "4h" / "1d"（长线）
-    layers: { ...LAYER_DEFAULT, ...store.load("layers", {}), ...(store.load("layersVer", 0) < 2 ? { ch: 1 } : {}) }, // 图上各图层开关，见 LAYERS
+    layers: { ...LAYER_DEFAULT, ...store.load("layers", {}), ...(store.load("layersVer", 0) < 2 ? { ch: 1 } : {}), ...(store.load("layersVer", 0) < 3 ? { setup: 1 } : {}) }, // 图上各图层开关，见 LAYERS
   };
   state.active = state.symbols[0];
-  store.save("layersVer", 2); // v2：平行通道改成锚点法后默认打开
+  store.save("layersVer", 3); // v2：平行通道改成锚点法后默认打开；v3：新增形态 A/B/C 图层
 
   const $ = (id) => document.getElementById(id);
   const decimals = (p) => (p >= 1000 ? 2 : p >= 10 ? 3 : p >= 1 ? 4 : 6);
@@ -319,6 +322,7 @@ const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在�
     recordJournal(sym, d.res.signals);
     checkAlerts(sym);
     checkSst(sym);
+    checkSetups(sym);
     if (first && sym === state.active) renderAll();
   }
 
@@ -349,14 +353,19 @@ const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在�
     const d = state.data[sym];
     if (!d || marketOf(sym) !== "crypto") return;
     try {
-      const [oi, pi] = await Promise.all([
+      // 多空比：散户账户多空比 + 大户持仓多空比（币安只保留 30 天，5 分钟一个点，取近 1 小时看变化）
+      const [oi, pi, ls, top] = await Promise.all([
         fetchJson(`/futures/data/openInterestHist?symbol=${sym}&period=5m&limit=60`),
         fetchJson(`/fapi/v1/premiumIndex?symbol=${sym}`),
+        fetchJson(`/futures/data/globalLongShortAccountRatio?symbol=${sym}&period=5m&limit=13`).catch(() => []),
+        fetchJson(`/futures/data/topLongShortPositionRatio?symbol=${sym}&period=5m&limit=13`).catch(() => []),
       ]);
       d.flow = {
         ...(d.flow ?? {}),
         hist: oi.map((x) => ({ t: x.timestamp / 1000 + 300, v: +x.sumOpenInterestValue })), // 统计值在该 5 分钟结束时才有
         funding: +pi.lastFundingRate, nextFunding: pi.nextFundingTime / 1000, mark: +pi.markPrice,
+        ls: ls.length ? { now: +ls[ls.length - 1].longShortRatio, h1: +ls[0].longShortRatio, long: +ls[ls.length - 1].longAccount } : null,
+        top: top.length ? { now: +top[top.length - 1].longShortRatio, h1: +top[0].longShortRatio } : null,
       };
       d.flow.live = d.flow.live ?? [];
     } catch (e) {
@@ -834,6 +843,57 @@ const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在�
     return S;
   }
 
+  // ── 形态引擎（setups.js）：每个周期一份，大周期定方向；只用已收盘K线，按最后一根收盘时间缓存 ──
+  // 实验十五（10 币 45 个月，含费用滑点资金费，样本内挑参数、样本外只看）：A/B 全部周期为负，C 只有 1h→4h 为正但未达显著。
+  // 所以这里只做显示，不推送。数字原样抄自 quant/results/exp15_setups.json
+  const SETUP_HTF = { "3m": "15m", "15m": "1h", "1h": "4h", "4h": "1d", "1d": "1w" };
+  const SETUP_BT = {
+    "15m": { A: [-0.244, -15.6, 5369], B: [-0.273, -6.6, 954], C: [-0.037, -1.0, 997] },
+    "1h": { A: [-0.136, -5.7, 2126], B: [-0.242, -2.9, 203], C: [0.127, 1.85, 263] },
+    "4h": { A: [-0.082, -3.4, 2096], B: [-0.067, -0.75, 210], C: null },
+  };
+  const SETUP_PARAMS = { "1h": { minScore: 50, htfFilterA: false } }; // = 样本内最优的那组（只影响 C 的共振分门槛）
+  const suCache = new Map();
+  function closedBars(sym, tf) {
+    const d = state.data[sym], cfg = TFS[tf];
+    if (!d || !cfg) return [];
+    const all = barsOf(d, tf), nowS = Date.now() / 1000;
+    let n = all.length;
+    while (n > 0 && all[n - 1].time + cfg.sec > nowS) n--;
+    return n === all.length ? all : all.slice(0, n);
+  }
+  function setupsOf(sym, tf) {
+    const d = state.data[sym];
+    if (!d || !TFS[tf]) return null;
+    const k = closedBars(sym, tf), htf = SETUP_HTF[tf];
+    if (k.length < 60) return null;
+    const hk = htf ? closedBars(sym, htf) : [];
+    const ck = `${sym}|${tf}|${k.length}|${k[k.length - 1].time}|${hk[hk.length - 1]?.time}`;
+    if (suCache.get(`${sym}|${tf}`)?.ck === ck) return suCache.get(`${sym}|${tf}`).v;
+    const kk = k.slice(-1500), mo = tf === "1h" || tf === "4h" || tf === "1d" ? 96 : 96;
+    const v = Setups.detect(kk, TFS[tf].sec, hk.slice(-1000), htf ? TFS[htf].sec : 0, { maxBars: mo, ...(SETUP_PARAMS[tf] ?? {}) });
+    v.k = kk; v.tf = tf;
+    suCache.set(`${sym}|${tf}`, { ck, v });
+    return v;
+  }
+  // 新形态只记到事件流里（不弹窗、不推送 —— 回测没通过）
+  function checkSetups(sym) {
+    const d = state.data[sym];
+    if (!d) return;
+    for (const tf of ["15m", "1h"]) {
+      const v = setupsOf(sym, tf);
+      if (!v) continue;
+      const seen = ((d.suSeen ??= {})[tf] ??= new Set(v.events.map((e) => e.time)));
+      for (const e of v.events) {
+        if (seen.has(e.time)) continue;
+        seen.add(e.time);
+        if (Date.now() / 1000 - (e.time + TFS[tf].sec) > 2 * TFS[tf].sec) continue;
+        state.feed.unshift({ sym, t: Date.now() / 1000, html: `<b class="${e.side > 0 ? "long" : "short"}">${e.kind}·${e.name}${e.side > 0 ? "多" : "空"}</b> ${tf} @ ${fmtPrice(e.entry)} 止损 ${fmtPrice(e.sl)} <span class="muted">共振${e.score}</span>` });
+        renderFeed();
+      }
+    }
+  }
+
   // ── 结构策略（structstrat.js）：1h 出信号、4h 定方向，参数 = 回测选定的默认值 ──
   // 回测（实验十三/十四，10 个币 45 个月，含费用滑点资金费）写在面板里，改参数必须重跑实验
   const SST_BT = { n: 2580, win: 51, net: 0.025, t: 0.98, oos: 0.058, oosT: 1.44, base: -0.067, diffT: 3.1, years: "2023 +0.02 / 2024 -0.02 / 2025 +0.03 / 2026 +0.10" };
@@ -1108,6 +1168,40 @@ const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在�
     return { items, tags };
   }
 
+  // 形态图元：最近一笔（持仓中或 20 根内触发的）画入场/止损/TP1/TP2 短线段；区间框；流动性和 FVG（每侧 1 个）
+  function setupItems(SU, k, sec, Ly, px) {
+    const items = [];
+    if (!k.length) return items;
+    const F = chartFrame(k, sec), { T, snap, futEnd } = F, a = SU.atrNow;
+    if (Ly.setup) {
+      const last = SU.events[SU.events.length - 1];
+      if (last && (last.open || SU.k.length - 1 - last.j <= 20)) {
+        const t0 = Math.max(snap(last.time), F.t0), t1 = last.open ? futEnd : Math.min(futEnd, SU.k[last.exitI]?.time ?? futEnd);
+        const seg = (p, color, label, dash = 0, w = 1.4) => items.push({ t: "line", t0: T(t0), p0: p, t1: T(t1), p1: p, color, width: w, dash, label, lc: color, prio: 1 });
+        seg(last.entry, "rgba(230,200,79,.95)", `${last.kind} ${last.name}${last.side > 0 ? "多" : "空"} 入场`);
+        seg(last.sl, "rgba(239,83,80,.95)", "止损", 0, 1.6);
+        seg(last.tp1, "rgba(38,166,154,.8)", last.kind === "B" ? "TP1 中线" : "TP1 1R", 1);
+        seg(last.tp2, "rgba(38,166,154,.95)", "TP2", 1);
+        if (last.level) items.push({ t: "line", t0: T(Math.max(snap(last.level.time), F.t0)), p0: last.level.price, t1: T(t0), p1: last.level.price, color: "rgba(230,200,79,.6)", width: 1, dash: 2, label: `被扫:${last.level.name}`, la: "mid", lc: "rgba(230,200,79,.9)", prio: 4 });
+      }
+      const R = SU.range;
+      if (R) items.push({ t: "rect", t0: T(Math.max(snap(R.from), F.t0)), t1: T(futEnd), lo: R.bot, hi: R.top, fill: "rgba(199,146,234,.05)", stroke: "rgba(199,146,234,.7)", edge: "frame", width: 1, dash: 1, label: `区间 B：下沿 1/4 做多 · 上沿 1/4 做空`, la: "left", prio: 3 });
+    }
+    if (Ly.liq) {
+      for (const side of ["H", "L"]) {
+        const d = side === "H" ? 1 : -1;
+        const q = SU.pools[side].filter((x) => (x.price - px) * d > 0 && Math.abs(x.price - px) <= 8 * a).sort((u, v) => Math.abs(u.price - px) - Math.abs(v.price - px))[0];
+        if (q) {
+          const nm = q.src === "pd" ? (d > 0 ? "昨高" : "昨低") : q.eq ? (d > 0 ? "等高" : "等低") : d > 0 ? "前高" : "前低";
+          items.push({ t: "line", t0: T(Math.max(snap(q.time), F.t0)), p0: q.price, t1: T(futEnd), p1: q.price, color: "rgba(230,200,79,.75)", width: 1, dash: 2, label: `$ ${nm}${q.eq ? "" : ""}`, lc: "rgba(230,200,79,1)", prio: 3 });
+        }
+        const g = SU.fvgs.filter((f) => f.dir === -d && !f.touched && Math.abs((f.top + f.bot) / 2 - px) <= 8 * a).sort((u, v) => v.i - u.i)[0];
+        if (g) items.push({ t: "rect", t0: T(Math.max(snap(g.time), F.t0)), t1: T(futEnd), lo: g.bot, hi: g.top, fill: g.dir > 0 ? "rgba(38,166,154,.09)" : "rgba(239,83,80,.09)", label: `FVG${g.dir > 0 ? "↑" : "↓"}`, la: "left", lc: g.dir > 0 ? "rgba(38,166,154,.9)" : "rgba(239,83,80,.9)", prio: 5 });
+      }
+    }
+    return items;
+  }
+
   // 高周期结构的唯一来源：图表和面板都从这里取，保证两边数字一致。
   // rgN 用 30/90，和 strategy.js 里 regimeN、quant/ 第 3 层实验的口径一致
   const STRUCT = {
@@ -1361,6 +1455,16 @@ const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在�
         }
       }
     }
+    // 形态 A/B/C：触发K线上标记，平仓的标 R
+    const SU = Ly.setup || Ly.liq ? setupsOf(sym, state.chartTf) : null;
+    if (SU && Ly.setup) {
+      const t0 = k[0].time;
+      for (const e of SU.events) {
+        if (e.time < t0) continue;
+        markers.push({ time: T(e.time), position: e.side > 0 ? "belowBar" : "aboveBar", color: e.kind === "A" ? "#e6c84f" : e.kind === "B" ? "#c792ea" : "#4fc3f7", shape: e.side > 0 ? "arrowUp" : "arrowDown", text: `${e.kind}${e.side > 0 ? "多" : "空"}` });
+        if (!e.open) { const xb = SU.k[e.exitI]; if (xb) markers.push({ time: T(xb.time), position: e.side > 0 ? "aboveBar" : "belowBar", color: e.r > 0 ? "rgba(38,166,154,.9)" : "rgba(239,83,80,.9)", shape: "circle", size: 0.5, text: `${e.r >= 0 ? "+" : ""}${e.r.toFixed(1)}R` }); }
+      }
+    }
     markers.sort((a, b) => a.time - b.time);
     candle.setMarkers(markers);
 
@@ -1392,6 +1496,7 @@ const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在�
     }
     // 大周期色带先画（在下面），本周期的线压在上面
     items.push(...hi.items, ...own.items);
+    if (SU) items.push(...setupItems(SU, k, ctf.sec, Ly, pxNow));
     // 价格轴标签：太多会叠成一团，离现价 8 ATR 以外的不挂
     // 价格轴只挂价格（性质已经写在图里的胶囊上），相距 < 0.3 ATR 的只挂一个，离现价 8 ATR 以外不挂
     const tagged = [];
@@ -1619,6 +1724,7 @@ const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在�
     setHtml("legend", lgParts.join(""));
     $("chartTitle").innerHTML = `${short(sym)} <span class="muted small">${CN_NAMES[sym] ?? ""} · ${MARKET_NAMES[marketOf(sym)]}永续 · ${isShort() ? "短线 " : "长线 "}${(CHART_TF[state.chartTf] ?? CHART_TF["15m"]).label}${sess ? " · " + sess.txt : ""}</span>`;
     renderStructPanel();
+    renderSetupPanel();
     if (!d?.live) { setHtml("liveScore", `<span class="muted">${d?.error ?? "加载中…"}</span>`); return; }
     const L = d.live, p = d.res.params;
 
@@ -1684,6 +1790,9 @@ const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在�
         </div>
         ${oiSpark(d)}<div class="muted small" style="display:flex;justify-content:space-between"><span>持仓量 近 2 小时</span><span>4h ${pctTxt(o4)}</span></div>
         ${read ? `<div class="phase">${read}</div>` : ""}
+        ${fl?.ls ? `<div class="tf-line" style="grid-template-columns:1fr 1fr 1fr"><span>散户多空比 <b class="num">${fl.ls.now.toFixed(2)}</b> <span class="muted small">1h前 ${fl.ls.h1.toFixed(2)}</span></span>
+          <span>大户持仓多空比 <b class="num">${fl.top ? fl.top.now.toFixed(2) : "-"}</b> <span class="muted small">${fl.top ? "1h前 " + fl.top.h1.toFixed(2) : ""}</span></span>
+          <span class="muted small">${fl.top && (fl.ls.now - 1) * (fl.top.now - 1) < 0 ? "散户和大户方向相反，以大户为准" : fl.ls.now > 2.5 ? "散户极度偏多（反向参考）" : fl.ls.now < 0.8 ? "散户偏空（反向参考）" : ""}</span></div>` : ""}
         <div class="tf-line" style="grid-template-columns:1fr 1fr"><span>资金费率 <b class="num ${fundRate > 0.03 ? "long" : fundRate < -0.01 ? "short" : ""}">${fundRate == null ? "-" : fundRate.toFixed(4) + "%"}</b></span>
           <span class="muted">${fundMin == null ? "" : `距结算 ${Math.floor(fundMin / 60)}小时${fundMin % 60}分`}</span></div>
         <div class="muted small" style="margin-top:4px">主动买入占比 ≥60%（做空时 ≤40%）的信号K线会标「过热」：6 个月回测里这类信号每笔 -0.15R，明显差于其他信号。持仓量每 10 秒更新；它和价格的组合目前没有找到稳定规律（见 README），仅供参考。</div>`);
@@ -1932,8 +2041,62 @@ const LightweightCharts = window.LightweightCharts; // vendor 是 UMD，挂在�
     setHtml("structPanel", html);
   }
 
+  // 交易形态面板：当前周期最近一笔 + 正在接近的形态 + 资金面加减分 + 回测
+  function renderSetupPanel() {
+    const sym = state.active, d = state.data[sym], tf = state.chartTf;
+    const SU = d ? setupsOf(sym, tf) : null;
+    if (!SU) { setHtml("setupPanel", '<span class="muted small">加载中 / 数据不足</span>'); return; }
+    const px = barsOf(d, tf).at(-1)?.close ?? SU.k.at(-1).close, a = SU.atrNow, sec = TFS[tf].sec;
+    const side = (e) => `<b class="${e.side > 0 ? "long" : "short"}">${e.side > 0 ? "做多" : "做空"}</b>`;
+    const rows = [];
+    const last = SU.events[SU.events.length - 1];
+    if (last) {
+      const age = SU.k.length - 1 - last.j;
+      const st = last.open ? (last.hitTp1 ? "已到 TP1，止损在保本" : `持仓中 · 浮动 <b class="${(px - last.entry) * last.side >= 0 ? "long" : "short"}">${(((px - last.entry) * last.side) / last.risk).toFixed(2)}R</b>`)
+        : `已结束 <b class="${last.r > 0 ? "long" : "short"}">${last.r >= 0 ? "+" : ""}${last.r.toFixed(2)}R</b>（未扣费）`;
+      let why = last.kind === "A" ? `扫了${last.level.name} ${fmtPrice(last.level.price)}（针到 ${fmtPrice(last.ext)}）后收回`
+        : last.kind === "B" ? `区间 ${fmtPrice(last.range.bot)}~${fmtPrice(last.range.top)} ${last.side > 0 ? "下沿" : "上沿"}出现有力度的反转K线`
+        : `大周期${last.side > 0 ? "向上" : "向下"}，回调 ${(last.retr * 100).toFixed(0)}% 后小周期 ${last.brk.kind}`;
+      rows.push(["最近一笔", `${last.kind}·${last.name} ${side(last)} <span class="muted">${fmtTime(last.time)}（${age} 根前）</span> · ${st}<br><span class="muted small">${why}</span><br>
+        <span class="num small">入场 ${fmtPrice(last.entry)} · 止损 <span class="short">${fmtPrice(last.sl)}</span> · TP1 ${fmtPrice(last.tp1)} · TP2 ${fmtPrice(last.tp2)}</span>
+        <br><span class="muted small">共振 ${last.score}：${last.items.join("、") || "无"}</span>`]);
+      // 资金面加减分（只对持仓中的那笔、只有加密货币；历史只有 30 天，没法回测，只做参考）
+      const fl = d.flow;
+      if (last.open && fl && marketOf(sym) === "crypto") {
+        const notes = [], dd = last.side, o1 = oiChange(d, 3600);
+        if (fl.ls) notes.push((fl.ls.now - 1) * dd < 0 ? `<span class="long">+ 散户反向（多空比 ${fl.ls.now.toFixed(2)}）</span>` : `<span class="short">− 散户同向（多空比 ${fl.ls.now.toFixed(2)}）</span>`);
+        if (fl.top) notes.push((fl.top.now - fl.top.h1) * dd > 0 ? '<span class="long">+ 大户在加同向仓</span>' : '<span class="muted">大户没跟</span>');
+        notes.push(fl.funding * dd < 0 ? `<span class="long">+ 资金费率对${dd > 0 ? "空" : "多"}头不利</span>` : fl.funding * dd > 0.0003 ? '<span class="short">− 同向拥挤（资金费率高）</span>' : '<span class="muted">资金费率中性</span>');
+        if (last.kind === "A" && o1 != null) notes.push(o1 < -0.3 ? '<span class="long">+ 刺穿时持仓下降（止损盘出清）</span>' : '<span class="muted">持仓没有明显下降</span>');
+        rows.push(["资金面", notes.join(" · ")]);
+      }
+    } else rows.push(["最近一笔", '<span class="muted">这段K线里没有触发</span>']);
+    // 正在接近：现价 1ATR 内的未扫流动性（A）/ 区间边缘（B）
+    const near = [];
+    for (const [sd, nm] of [["L", "下方"], ["H", "上方"]]) {
+      const q = SU.pools[sd].filter((x) => (sd === "L" ? x.price < px : x.price > px) && Math.abs(x.price - px) <= 1.2 * a).sort((u, v) => Math.abs(u.price - px) - Math.abs(v.price - px))[0];
+      if (q) near.push(`${nm}${q.src === "pd" ? (sd === "L" ? "昨低" : "昨高") : q.eq ? (sd === "L" ? "等低" : "等高") : sd === "L" ? "前低" : "前高"} <b class="num">${fmtPrice(q.price)}</b>：刺穿后 ${SETUP_PARAMS[tf]?.reclaimBars ?? 3} 根内收回 → A ${sd === "L" ? "多" : "空"}`);
+    }
+    if (SU.range) {
+      const R = SU.range, pos = (px - R.bot) / R.w;
+      near.push(`区间 ${fmtPrice(R.bot)}~${fmtPrice(R.top)}，现价在 <b>${Math.round(pos * 100)}%</b>${pos <= 0.25 ? " → 下沿，等有力度的阳线做多 B" : pos >= 0.75 ? " → 上沿，等有力度的阴线做空 B" : "（中间，不做）"}`);
+    }
+    if (SU.bias) near.push(`大周期（${TFS[SETUP_HTF[tf]]?.label}）${SU.bias > 0 ? '<span class="long">向上</span>' : '<span class="short">向下</span>'}：等回调 ≥50% 后的同向 BOS/CHoCH → C ${SU.bias > 0 ? "多" : "空"}`);
+    rows.push(["正在接近", near.length ? near.join("<br>") : '<span class="muted">附近没有待扫的流动性 / 区间</span>']);
+    // 本周期近 1500 根的结果（未扣费）
+    const done = SU.events.filter((e) => !e.open);
+    const by = ["A", "B", "C"].map((kd) => { const a2 = done.filter((e) => e.kind === kd); return a2.length ? `${kd} ${a2.length}笔 ${(a2.reduce((x, e) => x + e.r, 0) / a2.length).toFixed(2)}R` : `${kd} -`; });
+    rows.push(["本图近况", `<span class="small">${by.join(" · ")} <span class="muted">（近 ${SU.k.length} 根，未扣费，样本小）</span></span>`]);
+    const bt = SETUP_BT[tf === "3m" ? "15m" : tf === "1d" ? "4h" : tf];
+    const btTxt = (kd) => { const x = bt?.[kd]; return x ? `${kd} <b class="${x[0] > 0 ? "long" : "short"}">${x[0] >= 0 ? "+" : ""}${x[0].toFixed(3)}R</b> <span class="muted">t=${x[1]} ${x[2]}笔</span>` : `${kd} <span class="muted">笔数不足</span>`; };
+    rows.push(["回测", `<span class="small">${["A", "B", "C"].map(btTxt).join(" · ")}<br><span class="muted">实验十五：10 币 45 个月，扣费+滑点+资金费，样本内挑参数、表中是样本外 2025-26 每笔净 R。
+      通过标准 = 样本外净 R>0、t≥2、≥6/10 个币为正。<b>三类形态都没通过</b>：A/B 扣费前就≈0（假突破收回、区间反转在加密上没有统计优势，扣掉成本必亏，15m 尤其明显）；
+      C 在 1h→4h 上样本内 +0.19R（t=2.6）、样本外 +0.13R（t=1.85，8/10 个币为正），接近但没过。所以只做显示，不推送。</span></span>`]);
+    setHtml("setupPanel", `<div class="st-detail">${rows.map(([x, y]) => `<div class="row"><span class="muted">${x}</span><span>${y}</span></div>`).join("")}</div>`);
+  }
+
   function renderLayerBar() {
-    const chips = LAYERS.map((L, i) => (i === 8 ? '<span class="sep"></span>' : "") +
+    const chips = LAYERS.map((L, i) => (L.id === "setup" ? '<span class="sep"></span>' : "") +
       `<button class="chip${state.layers[L.id] ? " on" : ""}" data-layer="${L.id}" title="${L.tip}"><i style="background:${L.color}"></i>${L.name}</button>`).join("");
     const presets = Object.keys(LAYER_PRESETS).map((k) => `<button class="chip preset" data-preset="${k}">${k}</button>`).join("");
     const clean = `<button class="chip${state.layers.clean ? " on" : ""}" data-layer="clean" title="精简：每侧只留最重要的 2 条线（日线 3 条），多周期重叠的合成一条；短线和长线用不同规则。关掉 = 显示全部">✂ 精简</button>`;
